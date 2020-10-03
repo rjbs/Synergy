@@ -11,7 +11,12 @@ use Archive::Zip;
 use Archive::Zip::MemberRead;
 use Future;
 use JSON::MaybeXS;
-use Synergy::Util qw( result_ok result_err );
+
+use Synergy::Util qw(
+  canonicalize_names
+
+  result_ok result_err
+);
 
 use Synergy::Logger '$Logger';
 
@@ -77,6 +82,26 @@ has tag_config_f => (
     });
   },
 );
+
+sub _tag_to_search ($self, $tag) {
+  my ($got_p) = $self->project_for_shortcut($tag)->get;
+  return [ [ project => "#$tag" ] ] if $got_p->is_ok && $got_p->is_nil;
+
+  my $got = $self->tag_config_f->get->{$tag};
+
+  unless ($got) {
+    return [ [ tags => fc $tag ] ];
+  }
+
+  if ($got->{target} && $got->{target}->@*) {
+    return [ map {; [ tags => $_ ] } $got->{target}->@* ];
+  }
+
+  # TODO: support specials?
+
+  # ???
+  return;
+}
 
 sub _get_treeitem_shortcuts {
   my ($self, $type) = @_;
@@ -174,6 +199,75 @@ sub project_for_shortcut ($self, $shortcut) {
 sub task_for_shortcut ($self, $shortcut) {
   $self->_item_for_shortcut(task => $shortcut);
 }
+
+sub _parse_search ($self, $text) {
+  my %aliases = (
+    u => 'owner',
+    o => 'owner',
+    user => 'owner',
+  );
+
+  state $prefix_re  = qr{!?\^?};
+
+  my $fallback = sub ($text_ref) {
+    if ($$text_ref =~ s/^\#\#?($Synergy::Util::ident_re)(?: \s | \z)//x) {
+      my $tag = $1;
+
+      my $instr = $self->_tag_to_search($tag);
+      return @$instr;
+    }
+
+    if ($$text_ref =~ s/^($prefix_re)$Synergy::Util::qstring\s*//x) {
+      my ($prefix, $word) = ($1, $2);
+
+      return [
+        'name',
+        ( $prefix eq ""   ? "contains"
+        : $prefix eq "^"  ? "starts_with"
+        : $prefix eq "!^" ? "does_not_start_with"
+        : $prefix eq "!"  ? "does_not_contain" # fake operator
+        :                   ()),
+        ($word =~ s/\\(["“”])/$1/gr)
+      ]
+    }
+
+    # Just a word.
+    ((my $token), $$text_ref) = split /\s+/, $$text_ref, 2;
+    $token =~ s/\A($prefix_re)//;
+    my $prefix = $1;
+
+    return [
+      'name',
+      ( $prefix eq ""    ? "contains"
+      : $prefix eq "^"   ? "starts_with"
+      : $prefix eq "!^"  ? "does_not_start_with"
+      : $prefix eq "!"   ? "does_not_contain" # fake operator
+      :                    undef),
+      $token,
+    ];
+  };
+
+  my $hunks = Synergy::Util::parse_colonstrings($text, { fallback => $fallback });
+
+  canonicalize_names($hunks, \%aliases);
+
+  # XXX This is garbage, we want a "real" error.
+  # The valid forms are [ name => value ] and [ name => op => value ]
+  # so [ name => x = y => z... ] is too many and we barf.
+  # -- rjbs, 2019-06-23
+  return undef if grep {; @$_ > 3 } @$hunks;
+
+  return [
+    map {;
+      +{
+        field => $_->[0],
+        (@$_ > 2) ? (op => $_->[1], value => $_->[2])
+                  : (               value => $_->[1]),
+      }
+    } @$hunks
+  ];
+}
+
 
 no Moose;
 __PACKAGE__->meta->make_immutable;

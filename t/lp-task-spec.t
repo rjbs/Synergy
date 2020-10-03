@@ -356,7 +356,7 @@ plan_ok(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search("foo"),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search("foo"),
   [
     { field => 'name', op => 'contains', value => 'foo' },
   ],
@@ -364,7 +364,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search("foo done:1 bar"),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search("foo done:1 bar"),
   [
     { field => 'name', op => 'contains', value => 'foo' },
     { field => 'done',                   value => '1'   },
@@ -374,7 +374,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search(q{^"Feature \\"requests\\""}),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search(q{^"Feature \\"requests\\""}),
   [
     { field => 'name', op => 'starts_with', value => 'Feature "requests"' },
   ],
@@ -382,7 +382,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search("foo done:1 type:*"),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search("foo done:1 type:*"),
   [
     { field => 'name', op => 'contains', value => 'foo' },
     { field => 'done',                    value => '1'   },
@@ -395,7 +395,7 @@ TODO: {
   local $TODO = "tests not rewritten for new zip-based tags";
 
   is_deeply(
-    $synergy->reactor_named('lp')->_parse_search("foo done:1 in:#tx"),
+    $synergy->reactor_named('lp')->lp_helper->_parse_search("foo done:1 in:#tx"),
     [
       { field => 'name',  op => 'contains', value => 'foo' },
       { field => 'done',                    value => '1'   },
@@ -405,7 +405,7 @@ TODO: {
   );
 
   is_deeply(
-    $synergy->reactor_named('lp')->_parse_search(q{#tx bar}),
+    $synergy->reactor_named('lp')->lp_helper->_parse_search(q{#tx bar}),
     [
       { field => 'tags',                      value => 'topicbox' },
       { field => 'name',    op => 'contains', value => 'bar' },
@@ -416,7 +416,7 @@ TODO: {
 
 for my $u ("user:bar", "u:bar", "o:bar", "owner:bar") {
   is_deeply(
-    $synergy->reactor_named('lp')->_parse_search("foo $u"),
+    $synergy->reactor_named('lp')->lp_helper->_parse_search("foo $u"),
     [
       { field => 'name',  op => 'contains', value => 'foo' },
       { field => 'owner',                   value => 'bar' },
@@ -426,7 +426,7 @@ for my $u ("user:bar", "u:bar", "o:bar", "owner:bar") {
 }
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search(q{project:"JR \\"Bob\\" Dobbs" bob}),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search(q{project:"JR \\"Bob\\" Dobbs" bob}),
   [
     { field => 'project',                   value => q{JR "Bob" Dobbs} },
     { field => 'name',    op => 'contains', value => 'bob' },
@@ -435,7 +435,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search(q{bar created:after:2019-01-01 foo}),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search(q{bar created:after:2019-01-01 foo}),
   [
     { field => 'name',    op => 'contains', value => 'bar' },
     { field => 'created', op => 'after',    value => '2019-01-01' },
@@ -445,7 +445,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search(q{bar created:after:"2019-02-02" foo}),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search(q{bar created:after:"2019-02-02" foo}),
   [
     { field => 'name',    op => 'contains', value => 'bar' },
     { field => 'created', op => 'after',    value => '2019-02-02' },
@@ -455,7 +455,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search(q{bar created:after:“2019-02-02” foo}),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search(q{bar created:after:“2019-02-02” foo}),
   [
     { field => 'name',    op => 'contains', value => 'bar' },
     { field => 'created', op => 'after',    value => '2019-02-02' },
@@ -465,7 +465,7 @@ is_deeply(
 );
 
 is_deeply(
-  $synergy->reactor_named('lp')->_parse_search(q{bar created:"after":"2019-02-02" foo}),
+  $synergy->reactor_named('lp')->lp_helper->_parse_search(q{bar created:"after":"2019-02-02" foo}),
   [
     { field => 'name',    op => 'contains', value => 'bar' },
     { field => 'created', op => 'after',    value => '2019-02-02' },

@@ -1024,26 +1024,6 @@ sub _tag_to_plan ($self, $tag) {
   };
 }
 
-sub _tag_to_search ($self, $tag) {
-  my ($got_p) = $self->project_for_shortcut($tag)->get;
-  return [ [ project => "#$tag" ] ] if $got_p->is_ok && $got_p->is_nil;
-
-  my $got = $self->tag_config_f->get->{$tag};
-
-  unless ($got) {
-    return [ [ tags => fc $tag ] ];
-  }
-
-  if ($got->{target} && $got->{target}->@*) {
-    return [ map {; [ tags => $_ ] } $got->{target}->@* ];
-  }
-
-  # TODO: support specials?
-
-  # ???
-  return;
-}
-
 sub reload_tags ($self, $event) {
   $event->mark_handled;
 
@@ -2174,74 +2154,6 @@ sub _handle_tasks ($self, $event, $text) {
   );
 }
 
-sub _parse_search ($self, $text) {
-  my %aliases = (
-    u => 'owner',
-    o => 'owner',
-    user => 'owner',
-  );
-
-  state $prefix_re  = qr{!?\^?};
-
-  my $fallback = sub ($text_ref) {
-    if ($$text_ref =~ s/^\#\#?($Synergy::Util::ident_re)(?: \s | \z)//x) {
-      my $tag = $1;
-
-      my $instr = $self->_tag_to_search($tag);
-      return @$instr;
-    }
-
-    if ($$text_ref =~ s/^($prefix_re)$Synergy::Util::qstring\s*//x) {
-      my ($prefix, $word) = ($1, $2);
-
-      return [
-        'name',
-        ( $prefix eq ""   ? "contains"
-        : $prefix eq "^"  ? "starts_with"
-        : $prefix eq "!^" ? "does_not_start_with"
-        : $prefix eq "!"  ? "does_not_contain" # fake operator
-        :                   ()),
-        ($word =~ s/\\(["“”])/$1/gr)
-      ]
-    }
-
-    # Just a word.
-    ((my $token), $$text_ref) = split /\s+/, $$text_ref, 2;
-    $token =~ s/\A($prefix_re)//;
-    my $prefix = $1;
-
-    return [
-      'name',
-      ( $prefix eq ""    ? "contains"
-      : $prefix eq "^"   ? "starts_with"
-      : $prefix eq "!^"  ? "does_not_start_with"
-      : $prefix eq "!"   ? "does_not_contain" # fake operator
-      :                    undef),
-      $token,
-    ];
-  };
-
-  my $hunks = Synergy::Util::parse_colonstrings($text, { fallback => $fallback });
-
-  canonicalize_names($hunks, \%aliases);
-
-  # XXX This is garbage, we want a "real" error.
-  # The valid forms are [ name => value ] and [ name => op => value ]
-  # so [ name => x = y => z... ] is too many and we barf.
-  # -- rjbs, 2019-06-23
-  return undef if grep {; @$_ > 3 } @$hunks;
-
-  return [
-    map {;
-      +{
-        field => $_->[0],
-        (@$_ > 2) ? (op => $_->[1], value => $_->[2])
-                  : (               value => $_->[1]),
-      }
-    } @$hunks
-  ];
-}
-
 sub _compile_search ($self, $conds, $from_user) {
   my %flag;
   my %display;
@@ -2563,7 +2475,7 @@ sub _handle_tsearch ($self, $event, $text) {
 }
 
 sub _handle_search ($self, $event, $text, $arg = {}) {
-  my $instructions = $self->_parse_search($text);
+  my $instructions = $self->helper->_parse_search($text);
 
   # This is stupid. -- rjbs, 2019-03-30
   unless (defined $instructions) {
@@ -4643,9 +4555,10 @@ sub iteration_report ($self, $who, $arg = {}) {
 }
 
 sub reload_shortcuts ($self, $event) {
-  $self->_set_projects($self->get_project_shortcuts);
-  $self->_set_tasks($self->get_task_shortcuts);
-  $event->reply("Shortcuts reloaded.");
+  $self->lp_helper->clear_project_shortcuts;
+  $self->lp_helper->clear_task_shortcuts;
+
+  $event->reply("Shortcut cache cleared.");
   $event->mark_handled;
 }
 
