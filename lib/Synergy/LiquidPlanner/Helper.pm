@@ -113,7 +113,7 @@ has tag_config_f => (
 
 sub _tag_to_search ($self, $tag) {
   my ($got_p) = $self->project_for_shortcut($tag)->get;
-  return [ [ project => "#$tag" ] ] if $got_p->is_ok && $got_p->is_nil;
+  return [ [ project => "#$tag" ] ] if $got_p->is_ok && ! $got_p->is_nil;
 
   my $got = $self->tag_config_f->get->{$tag};
 
