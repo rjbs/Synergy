@@ -3,6 +3,7 @@ roxy:
   realname: Roxanne Pelligrini
   lp_id: 1
   lp_token: "8675309"
+  is_master: 1
 stormer:
   realname: Mary Phillips
   lp_id: 2

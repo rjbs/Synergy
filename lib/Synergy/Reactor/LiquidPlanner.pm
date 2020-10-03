@@ -16,11 +16,12 @@ use LiquidPlanner::Client;
 use List::Util qw(first sum0 uniq);
 use Net::Async::HTTP;
 use POSIX qw(ceil);
-use JSON 2 ();
+use JSON::MaybeXS ();
 use Time::Duration;
 use Time::Duration::Parse;
 use Synergy::Logger '$Logger';
 use Synergy::LiquidPlanner::Client; # the old synchronous one; to replace!!
+use Synergy::LiquidPlanner::Helper;
 use Synergy::Timer;
 use Synergy::Util qw(
   parse_time_hunk pick_one bool_from_text
@@ -32,7 +33,7 @@ use DateTime::Format::ISO8601;
 
 use utf8;
 
-my $JSON = JSON->new->utf8;
+my $JSON = JSON::MaybeXS->new->utf8;
 
 my $TRIAGE_EMOJI = "\N{HELMET WITH WHITE CROSS}";
 
@@ -979,46 +980,17 @@ has tags_archive_url => (
   predicate => 'has_tags_archive_url',
 );
 
-has tag_config_f => (
+has lp_helper => (
   is => 'ro',
-  lazy    => 1,
-  clearer => 'clear_tag_config',
-  default => sub ($self) {
-    return Future->done({}) unless $self->has_tags_archive_url;
-    my $f = $self->hub->http_get($self->tags_archive_url);
-
-    $f->then(sub ($res) {
-      unless ($res->is_success) {
-        $Logger->log("Failed to get tags archive");
-        return Future->done({});
-      }
-
-      my $config;
-
-      my $zip_bytes = $res->decoded_content(charset => 'none');
-      require Archive::Zip;
-      require Archive::Zip::MemberRead;
-      open my $bogus_fh, '+<', \$zip_bytes;
-
-      my $zip = Archive::Zip->new;
-      unless ($zip->readFromFileHandle($bogus_fh) == Archive::Zip::AZ_OK()) {
-        $Logger->log("Failed to process tag archive zip content");
-        return Future->done({});
-      }
-
-      my $reader = Archive::Zip::MemberRead->new($zip, 'Tags/approved-tags.json');
-      my $json = q{};
-      while (my $str = $reader->getline) {
-        $json .= $str;
-      }
-
-      my $data = eval { $JSON->decode($json); };
-      unless ($data) {
-        $Logger->log("failed to get JSON from tag config");
-        return Future->done({});
-      }
-
-      return Future->done($data)
+  lazy => 1,
+  handles => [ qw( tag_config_f project_for_shortcut task_for_shortcut ) ],
+  default => sub ($self, @) {
+    return Synergy::LiquidPlanner::Helper->new({
+      http_provider => $self->hub,
+      lp_client     => $self->f_lp_client_for_master,
+      ($self->has_tags_archive_url
+        ? (tags_archive_url => $self->tags_archive_url)
+        : ()),
     });
   },
 );
@@ -1037,8 +1009,8 @@ sub _tag_to_plan ($self, $tag) {
   # The semantics of $project_identifier are suboptimal.  For now, it's just
   # the tag back over again.  Better would be an identifier, but that's going
   # to require more changes than I can cram in right this second.
-  my ($got_p) = $self->project_for_shortcut($tag);
-  return { project => $tag } if $got_p;
+  my ($got_p) = $self->project_for_shortcut($tag)->get;
+  return { project => $tag } if $got_p->is_ok && ! $got_p->is_nil;
 
   my $got = $self->tag_config_f->get->{$tag};
 
@@ -1053,8 +1025,8 @@ sub _tag_to_plan ($self, $tag) {
 }
 
 sub _tag_to_search ($self, $tag) {
-  my ($got_p) = $self->project_for_shortcut($tag);
-  return [ [ project => "#$tag" ] ] if $got_p;
+  my ($got_p) = $self->project_for_shortcut($tag)->get;
+  return [ [ project => "#$tag" ] ] if $got_p->is_ok && $got_p->is_nil;
 
   my $got = $self->tag_config_f->get->{$tag};
 
@@ -1075,8 +1047,7 @@ sub _tag_to_search ($self, $tag) {
 sub reload_tags ($self, $event) {
   $event->mark_handled;
 
-  $self->clear_tag_config;
-  $self->_clear_tag_resolver;
+  $self->lp_helper->clear_tag_config;
 
   $self->tag_config_f
     ->then(sub ($config) {
@@ -1089,34 +1060,6 @@ sub reload_tags ($self, $event) {
     })
     ->retain;
 }
-
-has projects => (
-  isa => 'HashRef',
-  traits => [ 'Hash' ],
-  handles => {
-    project_shortcuts     => 'keys',
-    _project_by_shortcut  => 'get',
-  },
-  lazy => 1,
-  default => sub ($self) {
-    $self->get_project_shortcuts;
-  },
-  writer    => '_set_projects',
-);
-
-has tasks => (
-  isa => 'HashRef',
-  traits => [ 'Hash' ],
-  handles => {
-    task_shortcuts    => 'keys',
-    _task_by_shortcut => 'get',
-  },
-  lazy => 1,
-  default => sub ($self) {
-    $self->get_task_shortcuts;
-  },
-  writer    => '_set_tasks',
-);
 
 has clients => (
   lazy    => 1,
@@ -1146,31 +1089,6 @@ sub reload_clients ($self, $event) {
   } else {
     $event->reply("There was a problem reloading the LiquidPlanner client list.  Now that list is empty.  Oops.");
   }
-}
-
-sub _item_for_shortcut ($self, $thing, $shortcut) {
-  my $getter = "_$thing\_by_shortcut";
-  my $things = $self->$getter(fc $shortcut);
-
-  unless ($things && @$things) {
-    return (0, qq{Sorry, I don't know a $thing with the shortcut "$shortcut".});
-  }
-
-  if (@$things > 1) {
-    return (0, qq{More than one LiquidPlanner $thing has the shortcut }
-             . qq{"$shortcut".  Their ids are: }
-             . join(q{, }, map {; $_->{id} } @$things));
-  }
-
-  return ($things->[0], undef);
-}
-
-sub project_for_shortcut ($self, $shortcut) {
-  $self->_item_for_shortcut(project => $shortcut);
-}
-
-sub task_for_shortcut ($self, $shortcut) {
-  $self->_item_for_shortcut(task => $shortcut);
 }
 
 sub start ($self) {
@@ -1334,56 +1252,6 @@ sub nag ($self, $timer, @) {
   }
 }
 
-sub _get_treeitem_shortcuts {
-  my ($self, $type) = @_;
-
-  my $lpc = $self->f_lp_client_for_master;
-  my $res = $lpc->query_items({
-    filters => [
-      [ item_type => '='  => $type    ],
-      [ is_done   => is   => 'false'  ],
-      [ "custom_field:'Synergy $type Shortcut'" => 'is_set' ],
-    ],
-  });
-
-  return {} unless $res->block_until_ready->is_done;
-
-  my %dict;
-  my %seen;
-
-  for my $item ($res->get->@*) {
-    # Impossible, right?
-    next unless my $shortcut = $item->{custom_field_values}{"Synergy $type Shortcut"};
-
-    # Because of is_packaged_version field leading to dupes. -- rjbs 2018-07-05
-    next if $seen{ $item->{id} }++;
-
-    # We'll deal with conflicts later. -- rjbs, 2018-01-22
-    $dict{ lc $shortcut } //= [];
-
-    # But don't add the same project twice. -- michael, 2018-04-24
-    my @existing = grep {; $_->{id} eq $item->{id} } $dict{ lc $shortcut }->@*;
-    if (@existing) {
-      $Logger->log([
-        qq{Duplicate %s %s found; got %s, conflicts with %s},
-        "\l$type",
-        $shortcut,
-        $item->{id},
-        [ map {; $_->{id} } @existing ],
-      ]);
-      next;
-    }
-
-    $item->{shortcut} = $shortcut; # needed?
-    push $dict{ lc $shortcut }->@*, $item;
-  }
-
-  return \%dict;
-}
-
-sub get_project_shortcuts ($self) { $self->_get_treeitem_shortcuts('Project') }
-sub get_task_shortcuts    ($self) { $self->_get_treeitem_shortcuts('Task') }
-
 sub lp_client_for_user ($self, $user) {
   return unless my $auth = $self->auth_header_for($user);
 
@@ -1407,7 +1275,7 @@ sub lp_client_for_user ($self, $user) {
 }
 
 sub f_lp_client_for_user ($self, $user) {
-  return unless my $auth = $self->auth_header_for($user);
+  return undef unless my $auth = $self->auth_header_for($user);
 
   LiquidPlanner::Client->new({
     auth_token    => $self->auth_header_for($user),
@@ -1520,12 +1388,12 @@ sub _check_plan_project ($self, $event, $plan, $error) {
   }
 
   my ($project_name) = keys %$project;
-  my ($item, $err) = $self->project_for_shortcut($project_name);
+  my $got = $self->project_for_shortcut($project_name)->get;
 
-  if ($item) {
-    $plan->{project_id} = $item->{id};
+  if ($got->is_ok) {
+    $plan->{project_id} = $got->value->{id};
   } else {
-    $error->{project} = $err;
+    $error->{project} = $got->error;
   }
 
   return;
@@ -1966,7 +1834,7 @@ sub _handle_update_for_package ($self, $event, $package, $cmd_line) {
   my $user = $event->from_user;
   my $lpc = $self->f_lp_client_for_user($user);
 
-  $lpc->http_request(PUT => "/packages/$package->{id}", JSON->new->encode($plan))
+  $lpc->http_request(PUT => "/packages/$package->{id}", JSON::MaybeXS->new->encode($plan))
     ->then(sub { $event->reply("Package closed: $name") })
     ->else(sub { $event->reply("Hmm, something went wrong closing $name") })
     ->retain;
@@ -1979,7 +1847,7 @@ sub _execute_item_update_plan ($self, $event, $item, $plan) {
   my %UPDATE_FIELD = map {; $_ => 1 } qw(name is_done);
   if (my @unknown = grep {; ! $UPDATE_FIELD{$_} } keys %$plan) {
     $event->reply( "Update plan for LP$item->{id}: ```"
-                 . JSON->new->canonical->encode($plan)
+                 . JSON::MaybeXS->new->canonical->encode($plan)
                  . "```");
 
     return $event->error_reply(
@@ -2709,7 +2577,7 @@ sub _handle_search ($self, $event, $text, $arg = {}) {
   if (grep {; $_->{field} eq 'debug' and $_->{value} == 255 } @$instructions) {
     return $event->reply(
       "The search compiled as follows: ```"
-      . JSON->new->pretty->canonical->encode($instructions)
+      . JSON::MaybeXS->new->pretty->canonical->encode($instructions)
       . "```"
     );
   }
@@ -2958,7 +2826,7 @@ sub _execute_search ($self, $lpc, $search, $orig_error = undef) {
   if ($flag{debug}) {
     return Future->done(
       reply => "I'm going to run this query: ```"
-             . JSON->new->pretty->canonical->encode(\%to_query)
+             . JSON::MaybeXS->new->pretty->canonical->encode(\%to_query)
              . "```"
     );
   }
@@ -5298,4 +5166,5 @@ sub _summarize_item_list ($self, $items, $arg) {
   };
 }
 
-1;
+no Moose;
+__PACKAGE__->meta->make_immutable;

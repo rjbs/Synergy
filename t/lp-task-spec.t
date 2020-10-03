@@ -67,7 +67,7 @@ for my $to_set (
 
 my $lp = $synergy->reactor_named('lp');
 
-$lp->_set_projects({
+$lp->lp_helper->{project_shortcuts_f} = Future->done({
   gorp => [ { id => 1, nickname => "GORP", name => "Eat More Gorp", } ],
   pies => [ { id => 2, nickname => "Pies", name => "Eat More Pies", } ],
 });

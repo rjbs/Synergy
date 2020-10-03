@@ -37,6 +37,8 @@ use Sub::Exporter -setup => [ qw(
   transliterate
 
   validate_business_hours describe_business_hours
+
+  result_ok result_err
 ) ];
 
 sub read_config_file ($filename) {
@@ -544,5 +546,30 @@ sub describe_business_hours ($value) {
   return join q{, }, map {; $desc{$_} ? "\u$_: $desc{$_}" : () }
     (qw(weekdays sun), @wdays, qw(sat weekends));
 }
+
+package Synergy::Result {
+  sub new {
+    my ($class, $ok, $value) = @_;
+
+    return bless [ $ok, (@_ > 2 ? $value : ()) ], $class;
+  }
+
+  sub is_ok  ($self) { !! $self->[0] }
+  sub is_nil ($self) { !! $self->[0] && @$self == 1 }
+  sub is_err ($self) {  ! $self->[0] }
+
+  sub value ($self) {
+    Carp::confess("tried to use error as value: $self->[1]") unless $self->[0];
+    return $self->[1];
+  }
+
+  sub error ($self) {
+    Carp::confess("tried to use value as error") if $self->[0];
+    return $self->[1];
+  }
+}
+
+sub result_ok  ($value) { Synergy::Result->new(1, $value) }
+sub result_err ($error) { Synergy::Result->new(0, $error) }
 
 1;
