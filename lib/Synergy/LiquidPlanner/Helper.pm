@@ -600,7 +600,7 @@ sub _compile_search ($self, $conds, $from_user) {
   return (\%flag, \%display, (%error ? \%error : undef));
 }
 
-sub _execute_search ($self, $lpc, $search, $orig_error = undef) {
+sub _execute_search ($self, $search, $orig_error = undef) {
   my %flag  = $search ? %$search : ();
 
   my %error = $orig_error ? %$orig_error : ();
@@ -816,7 +816,7 @@ sub _execute_search ($self, $lpc, $search, $orig_error = undef) {
     );
   }
 
-  my $search_f = $lpc
+  my $search_f = $self->lp_client
     ->query_items(\%to_query)
     ->else(sub {
       Future->done(error => "Something went wrong when running that search.");

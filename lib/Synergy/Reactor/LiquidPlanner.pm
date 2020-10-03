@@ -2202,8 +2202,7 @@ sub _handle_search ($self, $event, $text, $arg = {}) {
 
   $display->{header} //= 'Search results';
 
-  my $lpc = $self->f_lp_client_for_user($event->from_user);
-  my $future = $self->_execute_search($lpc, $search, $error);
+  my $future = $self->helper->_execute_search($search, $error);
   $self->_send_search_result($event, $future, $display);
 }
 
@@ -2284,8 +2283,7 @@ sub _handle_agenda ($self, $event, $text) {
     in    => $self->discussion_package_id,
   );
 
-  my $lpc     = $self->f_lp_client_for_user($event->from_user);
-  my $future  = $self->_execute_search($lpc, \%search, {});
+  my $future  = $self->helper->_execute_search(\%search, {});
 
   $self->_send_search_result($event, $future, \%display);
 }
@@ -2323,8 +2321,7 @@ sub _handle_quick_search ($self, $event, $text, $cmd, $munger) {
 
   $self->$munger($event, \%search, \%display);
 
-  my $lpc     = $self->f_lp_client_for_user($event->from_user);
-  my $future  = $self->_execute_search($lpc, \%search, {});
+  my $future  = $self->helper->_execute_search(\%search, {});
 
   $self->_send_search_result($event, $future, \%display);
 }
@@ -3777,8 +3774,6 @@ sub _handle_iteration ($self, $event, $rest) {
 }
 
 sub search_report ($self, $who, $arg = {}) {
-  my $lpc = $self->f_lp_client_for_user($who);
-
   # We copy it so we can edit things.  It's stupid, but it works.
   # -- rjbs, 2019-06-08
   my @search = map {;
@@ -3795,7 +3790,7 @@ sub search_report ($self, $who, $arg = {}) {
     return Future->done([ "[ search report failed! ]" ]);
   }
 
-  my $future = $self->_execute_search($lpc, $search, {});
+  my $future = $self->helper->_execute_search($search, {});
   $future->then(sub ($action, $itemlist) {
     unless ($action eq 'itemlist') {
       return Future->done([
