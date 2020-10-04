@@ -2276,15 +2276,16 @@ sub _handle_agenda ($self, $event, $text) {
   return $event->error_reply("Sorry, they're not in LiquidPlanner.")
     unless $target->lp_id;
 
-  my %display = (show => { assignees => 1 });
-  my %search  = (
+  my $future = $self->helper->_execute_search({
     owner => { $target->lp_id => 1 },
     in    => $self->discussion_package_id,
+  });
+
+  $self->_send_search_result(
+    $event,
+    $future,
+    { show => { assignees => 1 } },
   );
-
-  my $future = $self->helper->_execute_search(\%search, {});
-
-  $self->_send_search_result($event, $future, \%display);
 }
 
 # add triage tag
