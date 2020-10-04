@@ -2278,12 +2278,11 @@ sub _handle_agenda ($self, $event, $text) {
 
   my %display = (show => { assignees => 1 });
   my %search  = (
-    page  => $1 // 1,
     owner => { $target->lp_id => 1 },
     in    => $self->discussion_package_id,
   );
 
-  my $future  = $self->helper->_execute_search(\%search, {});
+  my $future = $self->helper->_execute_search(\%search, {});
 
   $self->_send_search_result($event, $future, \%display);
 }
