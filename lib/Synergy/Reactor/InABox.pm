@@ -66,6 +66,26 @@ has digitalocean_api_token => (
   required => 1,
 );
 
+has inabox_datacentres => (
+  is => 'ro',
+  isa => 'ArrayRef',
+  required => 1,
+);
+
+has inabox_versions => (
+  is => 'ro',
+  isa => 'ArrayRef',
+  default => sub ($self) {
+    return [$self->inabox_default_version];
+  },
+);
+
+has inabox_default_version => (
+  is => 'ro',
+  isa => 'Str',
+  default => 'buster',
+);
+
 sub _do_endpoint ($self, $endpoint) {
   return $self->digitalocean_api_base . $endpoint;
 }
@@ -167,7 +187,9 @@ sub _determine_version_and_tag ($self, $event, $switches) {
   # - the version, by request or from prefs or implied
   # - the tag, by request or from the version
   # - if this is the "default" box, which sets the "$username.box" DNS name
-  my $default_version = $self->get_user_preference($event->from_user, 'version');
+  my $default_version = $self->get_user_preference($event->from_user, 'version')
+    ? $self->get_user_preference($event->from_user, 'version')
+    : $self->inabox_default_version;
   my ($version, $tag) = $switches->@{qw(version tag)};
   my $is_default_box = !($version || $tag);
   $version //= $default_version;
@@ -596,7 +618,7 @@ sub _update_dns ($self, $name, $ip) {
 __PACKAGE__->add_preference(
   name      => 'version',
   validator => sub ($self, $value, @) {
-    my %known = map {; $_ => 1 } qw( jessie buster );
+    my %known = map {; $_ => 1 } $self->inabox_versions->@*;
 
     $value = lc $value;
 
@@ -607,17 +629,20 @@ __PACKAGE__->add_preference(
 
     return $value;
   },
-  default   => 'jessie',
+  default   => undef,
   description => 'Default Debian version for your fminabox',
 );
 
 __PACKAGE__->add_preference(
   name      => 'datacentre',
   validator => sub ($self, $value, @) {
+    my %known = map {; $_ => 1 } $self->inabox_datacentres->@*;
+
     $value = lc $value;
 
-    unless ($value =~ /\A[a-z0-9]+\z/) {
-      return (undef, "Hmm, $value doesn't seem like a valid datacentre name.");
+    unless ($known{$value}) {
+      my $datacentres = join q{, }, sort keys %known;
+      return (undef, "unknown datacentre $value; known datacentres are: $datacentres");
     }
 
     return $value;
