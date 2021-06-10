@@ -79,94 +79,88 @@ sub handle_ptn_mention ($self, $event) {
 
   my $replied = 0;
 
-  my @futures;
-
-  for my $id (@ids) {
-    my $f = $self->_output_ticket($event, $id);
-    push @futures, $f;
-  }
-
-  my $f = Future->wait_all(@futures);
-  $f->retain;
-
-  $f->on_ready(sub ($waiter) {
-    return unless $event->was_targeted;
-
-    my @failed = $waiter->failed_futures;
-    my @ids = map {; ($_->failure)[0] } @failed;
-    return unless @ids;
-
-    my $which = WORDLIST(@ids, { conj => "or" });
-    $event->reply("Sorry, I couldn't find any tickets for $which.");
-  });
-}
-
-sub _output_ticket ($self, $event, $id) {
-  return $self->zendesk_client->ticket_api->get_f($id)
-    ->then(sub ($ticket) {
-      my $status = $ticket->status;
-      my $subject = $ticket->subject;
-      my $created = str2time($ticket->created_at);
-      my $updated = str2time($ticket->updated_at);
-
-      my $text = "#%$id: $subject (status: $status)";
-
-      my $link = sprintf("<https://%s/agent/tickets/%s|#%s>",
-        $self->domain,
-        $id,
-        $id,
-      );
-
-      my $assignee = $ticket->assignee;
-      my @assignee = $assignee ?  [ "Assigned to" => $assignee->name ] : ();
-
-      my @brand;
-      if ( $self->has_brand_mapping && $ticket->brand_id) {
-        my $brand_text = $self->brand_mapping->{$ticket->brand_id};
-        @brand = [ Product => $brand_text ] if $brand_text;
+  $self->zendesk_client->ticket_api->get_many_f(\@ids)
+    ->then(sub ($tickets) {
+      my @got;
+      for my $ticket (@$tickets) {
+        push @got, $ticket->id;
+        $self->_output_ticket($event, $ticket);
       }
 
-      # slack block syntax is silly.
-      my @fields = map {;
-        +{
-           type => 'mrkdwn',
-           text => "*$_->[0]:* $_->[1]",
-         }
-      } (
-        @brand,
-        [ "Status"  => ucfirst($status) ],
-        [ "Opened"  => ago(time - $created) ],
-        [ "Updated" => ago(time - $updated) ],
-        @assignee,
-      );
+      return unless $event->was_targeted;
+      return if @got == @ids;
 
-      my $blocks = [
-        {
-          type => "section",
-          text => {
-            type => "mrkdwn",
-            text => "\N{MEMO} $link - $subject",
-          }
-        },
-        {
-          type => "section",
-          fields => \@fields,
-        },
-      ];
+      # Uh oh, we didn't get everything we wanted; if we were targeted, let's
+      # tell them.
+      my %have = map {; $_ => 1 } @got;
+      my @missing = grep {; ! $have{$_} } @ids;
 
-      $event->reply($text, {
-        slack => {
-          blocks => $blocks,
-          text => $text,
-        },
-      });
-
-      return Future->done(1);
+      my $which = WORDLIST(@ids, { conj => "or" });
+      $event->reply("Sorry, I couldn't find any tickets for $which.");
     })
-    ->else(sub (@err) {
-      $Logger->log([ "error fetching ticket %s from Zendesk", $id ]);
-      return Future->fail("PTN $id", 'http');
-    });
+    ->retain;
+
+  return;
+}
+
+sub _output_ticket ($self, $event, $ticket) {
+  my $id = $ticket->id;
+  my $status = $ticket->status;
+  my $subject = $ticket->subject;
+  my $created = str2time($ticket->created_at);
+  my $updated = str2time($ticket->updated_at);
+
+  my $text = "#$id: $subject (status: $status)";
+
+  my $link = sprintf("<https://%s/agent/tickets/%s|#%s>",
+    $self->domain,
+    $id,
+    $id,
+  );
+
+  my $assignee = $ticket->assignee;
+  my @assignee = $assignee ?  [ "Assigned to" => $assignee->name ] : ();
+
+  my @brand;
+  if ( $self->has_brand_mapping && $ticket->brand_id) {
+    my $brand_text = $self->brand_mapping->{$ticket->brand_id};
+    @brand = [ Product => $brand_text ] if $brand_text;
+  }
+
+  # slack block syntax is silly.
+  my @fields = map {;
+    +{
+       type => 'mrkdwn',
+       text => "*$_->[0]:* $_->[1]",
+     }
+  } (
+    @brand,
+    [ "Status"  => ucfirst($status) ],
+    [ "Opened"  => ago(time - $created) ],
+    [ "Updated" => ago(time - $updated) ],
+    @assignee,
+  );
+
+  my $blocks = [
+    {
+      type => "section",
+      text => {
+        type => "mrkdwn",
+        text => "\N{MEMO} $link - $subject",
+      }
+    },
+    {
+      type => "section",
+      fields => \@fields,
+    },
+  ];
+
+  $event->reply($text, {
+    slack => {
+      blocks => $blocks,
+      text => $text,
+    },
+  });
 }
 
 1;
