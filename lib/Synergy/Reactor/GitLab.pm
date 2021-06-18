@@ -5,7 +5,10 @@ package Synergy::Reactor::GitLab;
 
 use Moose;
 with 'Synergy::Role::Reactor::EasyListening',
-     'Synergy::Role::HasPreferences';
+     'Synergy::Role::HasPreferences',
+     'Synergy::Role::DeduplicatesExpandos' => {
+       expandos => [qw( mr commit )],
+     };
 
 use experimental qw(signatures);
 use namespace::clean;
@@ -70,60 +73,6 @@ has relevant_owners => (
   default => sub { [] },
 );
 
-has _recent_mr_expansions => (
-  is => 'ro',
-  isa => 'HashRef',
-  traits => ['Hash'],
-  lazy => 1,
-  default => sub { {} },
-  handles => {
-    has_expanded_mr_recently => 'exists',
-    note_mr_expansion        => 'set',
-    remove_mr_expansion      => 'delete',
-    recent_mr_expansions     => 'keys',
-    mr_expansion_for         => 'get',
-  },
-);
-
-has _recent_commit_expansions => (
-  is => 'ro',
-  isa => 'HashRef',
-  traits => ['Hash'],
-  lazy => 1,
-  default => sub { {} },
-  handles => {
-    has_expanded_commit_recently => 'exists',
-    note_commit_expansion        => 'set',
-    remove_commit_expansion      => 'delete',
-    recent_commit_expansions     => 'keys',
-    commit_expansion_for         => 'get',
-  },
-);
-
-# We'll only keep records of expansions for 5m or so.
-has expansion_record_reaper => (
-  is => 'ro',
-  lazy => 1,
-  default => sub ($self) {
-    return IO::Async::Timer::Periodic->new(
-      interval => 30,
-      on_tick  => sub {
-        my $then = time - (60 * 5);
-
-        for my $key ($self->recent_mr_expansions) {
-          my $ts = $self->mr_expansion_for($key);
-          $self->remove_mr_expansion($key) if $ts lt $then;
-        }
-
-        for my $key ($self->recent_commit_expansions) {
-          my $ts = $self->commit_expansion_for($key);
-          $self->remove_commit_expansion($key) if $ts lt $then;
-        }
-      },
-    );
-  }
-);
-
 after register_with_hub => sub ($self, @) {
   if (my $state = $self->fetch_state) {
     my $repo_state = $state->{repos} // {};
@@ -149,7 +98,6 @@ sub start ($self) {
 
   $timer->start;
   $self->hub->loop->add($timer);
-  $self->hub->loop->add($self->expansion_record_reaper->start);
 }
 
 sub state ($self) {
@@ -356,16 +304,6 @@ sub _load_auto_shortcuts ($self) {
     return unless keys %names;
     $self->add_shortcuts(%names);
   })->retain;
-}
-
-sub _key_for_gitlab_data ($self, $event, $data) {
-  # Not using $event->source_identifier here because we don't care _who_
-  # triggered the expansion. -- michael, 2019-02-05
-  return join(';',
-    $data->{id},
-    $event->from_channel->name,
-    $event->conversation_address
-  );
 }
 
 sub _parse_search ($self, $text) {
@@ -670,13 +608,12 @@ sub handle_merge_request ($self, $event) {
 
       my $is_approved = $approval_data->{approved};
 
-      my $key = $self->_key_for_gitlab_data($event, $data);
-      if ($self->has_expanded_mr_recently($key)) {
+      if ($self->has_expanded_mr_recently($event, $data->{id})) {
         $declined_to_reply++;
         return;
       }
 
-      $self->note_mr_expansion($key, time);
+      $self->note_mr_expansion($event, $data->{id});
 
       my $state = $data->{state};
 
@@ -816,13 +753,12 @@ sub handle_commit ($self, $event) {
 
       my $data = $JSON->decode($res->decoded_content);
 
-      my $key = $self->_key_for_gitlab_data($event, $data);
-      if ($self->has_expanded_commit_recently($key)) {
+      if ($self->has_expanded_commit_recently($event, $data->{id})) {
         $declined_to_reply++;
         return;
       }
 
-      $self->note_commit_expansion($key, time);
+      $self->note_commit_expansion($event, $data->{id});
 
       my $commit_url = sprintf("%s/%s/commit/%s",
         $self->url_base,
