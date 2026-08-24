@@ -580,7 +580,7 @@ command resolve => {
     });
   }
 
-  return await $event->error_reply("I don't know what you want to ack.  Check the help!");
+  return await $event->error_reply("I don't know what you want to resolve.  Check the help!");
 };
 
 command snooze => {
