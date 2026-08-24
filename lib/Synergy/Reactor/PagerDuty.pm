@@ -627,8 +627,9 @@ command snooze => {
     my $error = $@;
 
     if (my $incident = $res->{incident}) {
+      my $num = $incident->{incident_number};
       my $title = $incident->{title};
-      push @snoozed, "#$id ($title)";
+      push @snoozed, "#$num ($title)";
     } else {
       push @errors, $error->message;
     }
