@@ -524,7 +524,7 @@ responder 'give-oncall' => {
 command ack => {
   help => '*ack all*: acknowledge all triggered alerts in PagerDuty',
 } => async sub ($self, $event, $rest) {
-  unless ($rest && $rest eq 'all') {
+  if ($rest && $rest ne 'all') {
     return await $event->error_reply(q{The only thing you can "ack" is "all".});
   }
 
