@@ -4,17 +4,20 @@ package Synergy::Reactor::Vestaboard;
 use utf8;
 
 use Moose;
-with 'Synergy::Role::Reactor::EasyListening';
-with 'Synergy::Role::HTTPEndpoint';
+with 'Synergy::Role::Reactor::CommandPost',
+     'Synergy::Role::HTTPEndpoint';
 
 use namespace::clean;
 
 use Data::GUID qw(guid_string);
+use Future::AsyncAwait;
 use Lingua::EN::Inflect qw(NUMWORDS PL_N);
 use MIME::Base64 ();
 use Path::Tiny;
 use Plack::App::File;
 use Plack::Request;
+use Synergy::CommandPost;
+use Synergy::Util qw(reformat_help);
 use Synergy::VestaUtil;
 use Time::Duration;
 use Unicode::Normalize qw(NFD);
@@ -61,161 +64,55 @@ has is_simulation => (
   is => 'ro',
 );
 
-sub listener_specs {
-  return (
-    {
-      name      => 'vesta_edit',
-      method    => 'handle_vesta_edit',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { lc $e->text =~ /\Avesta edit /i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta edit `DESIGN`*: edit what is on the vestaboard",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_delete_design',
-      method    => 'handle_vesta_delete_design',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { lc $e->text =~ /\Avesta delete design / },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta delete design `DESIGN`*: delete one of your designs",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_designs',
-      method    => 'handle_vesta_designs',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { lc $e->text eq 'vesta designs' },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta designs*: list all your designs",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_post_text',
-      method    => 'handle_vesta_post_text',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta post text:? .+\z/i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta post text `TEXT`*: post a text message to the board",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_random_colors',
-      method    => 'handle_vesta_random_colors',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta random\s+colou?rs/i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta random colors*: post random colo(u)rs to the board",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_post',
-      method    => 'handle_vesta_post',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta post \S+\z/i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta post `DESIGN`*: post your design to the board",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_status',
-      method    => 'handle_vesta_status',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta status\z/i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta status*: check the board status and your token count",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_show_text',
-      method    => 'handle_vesta_show_text',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta show text /i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta show text `TEXT`*: show a preview of given text",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_show_design',
-      method    => 'handle_vesta_show_design',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta show design /i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta show design `DESIGN`*: show a preview of one of your designs",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_show',
-      method    => 'handle_vesta_show',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta show\z/i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta show*: see what's on the board",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_lock',
-      method    => 'handle_vesta_lock',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta (un)?lock\z/i },
-      help_entries => [
-        {
-          title => 'vesta',
-          text  => "*vesta lock/unlock*: (admins only) lock or unlock the board",
-        }
-      ],
-    },
-    {
-      name      => 'vesta_grant',
-      method    => 'handle_vesta_grant',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($, $e) { $e->text =~ /\Avesta grant/i },
-      allow_empty_help => 1, # unlisted admin command (for now)
-    },
+my @VESTA_SUBCOMMANDS = (
+  [ qr{\A delete \s+ design \s+ (\S.*) \z}xi,       \&handle_vesta_delete_design ],
+  [ qr{\A designs \z}xi,                            \&handle_vesta_designs ],
+  [ qr{\A edit \s+ (\S.*) \z}xi,                    \&handle_vesta_edit ],
+  [ qr{\A grant \b \s* (.*) \z}xis,                 \&handle_vesta_grant ],
+  [ qr{\A (un)?lock \z}xi,                          \&handle_vesta_lock ],
+  [ qr{\A post \s+ text :? \s+ (\S.*) \z}xi,        \&handle_vesta_post_text ],
+  [ qr{\A post \s+ (\S+) \z}xi,                     \&handle_vesta_post ],
+  [ qr{\A random \s+ colou?rs}xi,                   \&handle_vesta_random_colors ],
+  [ qr{\A show \s+ design \s+ (\S.*) \z}xi,         \&handle_vesta_show_design ],
+  [ qr{\A show \s+ text \s+ (\S.*) \z}xi,           \&handle_vesta_show_text ],
+  [ qr{\A show \z}xi,                               \&handle_vesta_show ],
+  [ qr{\A status \z}xi,                             \&handle_vesta_status ],
+);
+
+command vesta => {
+  help => reformat_help(<<~'EOH'),
+    *vesta* is how you talk to the Vestaboard.  Posting to the board costs a
+    token, and you only get so many of those, so choose your words wisely.
+
+    • *vesta show*: see what's on the board
+    • *vesta show text `TEXT`*: show a preview of given text
+    • *vesta show design `DESIGN`*: show a preview of one of your designs
+    • *vesta designs*: list all your designs
+    • *vesta edit `DESIGN`*: edit what is on the vestaboard
+    • *vesta delete design `DESIGN`*: delete one of your designs
+    • *vesta post `DESIGN`*: post your design to the board
+    • *vesta post text `TEXT`*: post a text message to the board
+    • *vesta random colors*: post random colo(u)rs to the board
+    • *vesta status*: check the board status and your token count
+    • *vesta lock*, *vesta unlock*: (admins only) lock or unlock the board
+    EOH
+} => async sub ($self, $event, $rest) {
+  for my $subcommand (@VESTA_SUBCOMMANDS) {
+    my ($regex, $handler) = @$subcommand;
+    next unless ($rest // q{}) =~ $regex;
+
+    # Every pattern above captures the subcommand's one argument, or captures
+    # nothing at all, in which case $#+ is zero and there's no argument to pass
+    # along. -- claude, 2026-09-02
+    my $arg = $#+ ? $1 : undef;
+
+    return await $handler->($self, $event, $arg);
+  }
+
+  return await $event->error_reply(
+    q{I don't know that vesta command.  Try "help vesta".}
   );
-}
+};
 
 has [ qw( subscription_id api_key api_secret ) ] => (
   is  => 'ro',
@@ -486,13 +383,11 @@ after register_with_hub => sub ($self, @) {
   return;
 };
 
-sub handle_vesta_show ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_show ($self, $event, $) {
   my $curr = $self->_current_characters;
 
   unless ($curr) {
-    return $event->reply("Sorry, I don't know what's on the board!");
+    return await $event->reply("Sorry, I don't know what's on the board!");
   }
 
   if ($self->vesta_image_base) {
@@ -500,7 +395,7 @@ sub handle_vesta_show ($self, $event) {
               ($self->vesta_image_base =~ s{/\z}{}r),
               Synergy::VestaUtil->encode_board($curr);
 
-    return $event->reply(
+    return await $event->reply(
       "The current board status is: $url",
       {
         slack => sprintf("Enjoy <%s|the current board status!>", $url),
@@ -513,7 +408,7 @@ sub handle_vesta_show ($self, $event) {
 
   my $whitespace = "\N{WHITE LARGE SQUARE}";
 
-  $event->reply(
+  return await $event->reply(
     $reply,
     {
       slack => ($reply =~ s/$whitespace/:spacer:/gr)
@@ -521,22 +416,17 @@ sub handle_vesta_show ($self, $event) {
   );
 }
 
-sub handle_vesta_show_text ($self, $event) {
-  $event->mark_handled;
-
-  my $text = $event->text;
-  $text =~ s/\Avesta show text\s+//;
-
+async sub handle_vesta_show_text ($self, $event, $text) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
 
   my ($board, $error) = Synergy::VestaUtil->text_to_board($text);
 
   unless ($board) {
-    return $event->error_reply("Sorry, I can't find that design!");
+    return await $event->error_reply("Sorry, I can't find that design!");
   }
 
   if ($self->vesta_image_base) {
@@ -545,7 +435,7 @@ sub handle_vesta_show_text ($self, $event) {
               Synergy::VestaUtil->encode_board($board),
               'cropped';
 
-    return $event->reply(
+    return await $event->reply(
       "You can see that design at: $url",
       {
         slack => sprintf("Behold, <%s|your text>", $url),
@@ -558,7 +448,7 @@ sub handle_vesta_show_text ($self, $event) {
 
   my $whitespace = "\N{WHITE LARGE SQUARE}";
 
-  $event->reply(
+  return await $event->reply(
     $reply,
     {
       slack => ($reply =~ s/$whitespace/:spacer:/gr)
@@ -566,23 +456,19 @@ sub handle_vesta_show_text ($self, $event) {
   );
 }
 
-sub handle_vesta_show_design ($self, $event) {
-  $event->mark_handled;
-
-  my $text = $event->text;
-  my $name = $text =~ s/\Avesta show design\s+//r;
+async sub handle_vesta_show_design ($self, $event, $name) {
   $name =~ s/[^\pL\pN\pM]/-/g;
 
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
 
   my $design = $self->_get_user_design_named($user, $name);
 
   unless ($design) {
-    return $event->error_reply("Sorry, I can't find that design!");
+    return await $event->error_reply("Sorry, I can't find that design!");
   }
 
   my $board = $design->{characters};
@@ -593,7 +479,7 @@ sub handle_vesta_show_design ($self, $event) {
               Synergy::VestaUtil->encode_board($board),
               'cropped';
 
-    return $event->reply(
+    return await $event->reply(
       "You can see that design at: $url",
       {
         slack => sprintf("Behold, your design <%s|%s>", $url, $design->{name}),
@@ -606,7 +492,7 @@ sub handle_vesta_show_design ($self, $event) {
 
   my $whitespace = "\N{WHITE LARGE SQUARE}";
 
-  $event->reply(
+  return await $event->reply(
     $reply,
     {
       slack => ($reply =~ s/$whitespace/:spacer:/gr)
@@ -614,23 +500,21 @@ sub handle_vesta_show_design ($self, $event) {
   );
 }
 
-sub handle_vesta_lock ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_lock ($self, $event, $un) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I can't help you out!");
+    return await $event->error_reply("I don't know who you are, so I can't help you out!");
   }
 
   unless (grep {; $_ eq $user->username } $self->board_admins) {
-    return $event->error_reply("Sorry, only board admins can lock or unlock the board");
+    return await $event->error_reply("Sorry, only board admins can lock or unlock the board");
   }
 
-  if ($event->text =~ /vesta unlock/i) {
+  if ($un) {
     $self->_set_lock_state({});
     $self->save_state;
-    return $event->reply("The board is now unlocked!");
+    return await $event->reply("The board is now unlocked!");
   }
 
   $self->_set_lock_state({
@@ -640,32 +524,30 @@ sub handle_vesta_lock ($self, $event) {
 
   $self->save_state;
 
-  return $event->reply("The board is locked!  Don't forget to unlock it later.");
+  return await $event->reply("The board is locked!  Don't forget to unlock it later.");
 }
 
-sub handle_vesta_grant ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_grant ($self, $event, $rest) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I can't help you out!");
+    return await $event->error_reply("I don't know who you are, so I can't help you out!");
   }
 
   unless (grep {; $_ eq $user->username } $self->board_admins) {
-    return $event->error_reply("Sorry, only board admins can grant tokens");
+    return await $event->error_reply("Sorry, only board admins can grant tokens");
   }
 
-  my ($who, $count) = $event->text =~ /^vesta grant\s+(\S+)\s+([0-9]+)\s+tokens/;
+  my ($who, $count) = $rest =~ /\A(\S+)\s+([0-9]+)\s+tokens/;
 
   unless ($who && length $count) {
-    return $event->error_reply(q{Hmm, I don't understand: use "vesta grant WHO COUNT tokens"});
+    return await $event->error_reply(q{Hmm, I don't understand: use "vesta grant WHO COUNT tokens"});
   }
 
   my $target = $self->resolve_name($who, $event->from_user);
 
   unless ($target) {
-    return $event->error_reply("Sorry, I don't know who $who is.");
+    return await $event->error_reply("Sorry, I don't know who $who is.");
   }
 
   $count = 10 if $count > 10;  # this isn't Nam, Walter.
@@ -676,42 +558,36 @@ sub handle_vesta_grant ($self, $event) {
   $token_state->{count} += $count;
   $self->save_state;
 
-  return $event->reply(sprintf("Ok! I've given %s %s %s.",
+  return await $event->reply(sprintf("Ok! I've given %s %s %s.",
     $target->username, $count, PL_N('token', $count)
   ));
 }
 
-sub handle_vesta_designs ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_designs ($self, $event, $) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I can't help you out!");
+    return await $event->error_reply("I don't know who you are, so I can't help you out!");
   }
 
   my $state = $self->_user_state->{ $user->username } //= {};
 
   unless ($state->{designs} && keys $state->{designs}->%*) {
-    return $event->reply("You don't have any Vestaboard designs on file.");
+    return await $event->reply("You don't have any Vestaboard designs on file.");
   }
 
   my $text = "Here are your designs on file:\n";
   $text .= "• $_->{name}\n" for values $state->{designs}->%*;
 
-  return $event->reply($text);
+  return await $event->reply($text);
 }
 
-sub handle_vesta_delete_design ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_delete_design ($self, $event, $name) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I can't help you out!");
+    return await $event->error_reply("I don't know who you are, so I can't help you out!");
   }
-
-  my ($name) = $event->text =~ /\Avesta delete design\s+(.+)/;
 
   $name =~ s/[^\pL\pN\pM]/-/g;
   $name =~ s/-{2,}/-/g;
@@ -721,23 +597,21 @@ sub handle_vesta_delete_design ($self, $event) {
   my $state = $self->_user_state->{ $user->username } //= {};
 
   unless (exists $state->{designs}{ $name_key }) {
-    return $event->reply("You don't have a design with that name.");
+    return await $event->reply("You don't have a design with that name.");
   }
 
   delete $state->{designs}{$name_key};
 
   $self->save_state;
 
-  return $event->reply("Okay, I've deleted that design.");
+  return await $event->reply("Okay, I've deleted that design.");
 }
 
-sub handle_vesta_status ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_status ($self, $event, $) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
 
   my $status;
@@ -767,24 +641,20 @@ sub handle_vesta_status ($self, $event) {
       duration($next - time);
   }
 
-  $event->reply($status);
+  return await $event->reply($status);
 }
 
-sub handle_vesta_edit ($self, $event) {
-  $event->mark_handled;
-
-  my $text = $event->text;
-  my $name = $text =~ s/\Avesta edit\s+//r;
+async sub handle_vesta_edit ($self, $event, $name) {
   $name =~ s/[^\pL\pN\pM]/-/g;
 
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
 
   if ($event->is_public) {
-    $event->reply("I'll send you a link to edit the Vestaboard in private.");
+    await $event->reply("I'll send you a link to edit the Vestaboard in private.");
   }
 
   my $secret = $self->_secret_for($user);
@@ -808,7 +678,7 @@ sub handle_vesta_edit ($self, $event) {
 
   $Logger->log("sending user $uri");
 
-  $event->private_reply(
+  return await $event->private_reply(
     "Okay, time to get editing! Click here: $uri",
     {
       slack => sprintf(
@@ -861,23 +731,20 @@ sub _get_user_design_named ($self, $user, $name) {
   return $design;
 }
 
-sub handle_vesta_post ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_post ($self, $event, $name) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
 
-  my ($name) = $event->text =~ /\Avesta post\s+(\S+)\z/i;
   my $design = $self->_get_user_design_named($user, $name);
 
   unless ($design) {
-    return $event->error_reply("Sorry, I couldn't find a design with that name.");
+    return await $event->error_reply("Sorry, I couldn't find a design with that name.");
   }
 
-  $self->_pay_to_post_payload(
+  return await $self->_pay_to_post_payload(
     $event,
     $user,
     {
@@ -886,25 +753,21 @@ sub handle_vesta_post ($self, $event) {
   );
 }
 
-sub handle_vesta_post_text ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_post_text ($self, $event, $text) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
-
-  my ($text) = $event->text =~ /\Avesta post text:? (.+)\z/i;
 
   my ($board, $error) = Synergy::VestaUtil->text_to_board($text);
 
   unless ($board) {
     $error //= "Something went wrong.";
-    return $event->error_reply("Sorry, I can't post that to the board.  $error");
+    return await $event->error_reply("Sorry, I can't post that to the board.  $error");
   }
 
-  $self->_pay_to_post_payload(
+  return await $self->_pay_to_post_payload(
     $event,
     $user,
     {
@@ -913,13 +776,11 @@ sub handle_vesta_post_text ($self, $event) {
   );
 }
 
-sub handle_vesta_random_colors ($self, $event) {
-  $event->mark_handled;
-
+async sub handle_vesta_random_colors ($self, $event, $) {
   my $user = $event->from_user;
 
   unless ($user) {
-    return $event->error_reply("I don't know who you are, so I'm not going to do that.");
+    return await $event->error_reply("I don't know who you are, so I'm not going to do that.");
   }
 
   # color codes for black + 7 blocks
@@ -933,7 +794,7 @@ sub handle_vesta_random_colors ($self, $event) {
     push @board, \@s;
   }
 
-  $self->_pay_to_post_payload(
+  return await $self->_pay_to_post_payload(
     $event,
     $user,
     {
@@ -964,15 +825,13 @@ sub _post_payload ($self, $payload) {
 sub _pay_to_post_payload ($self, $event, $user, $payload) {
   my $lock = $self->current_lock;
   if ($lock && $lock->{locked_by} ne $user->username) {
-    $event->error_reply("Sorry, the board can't be changed right now!");
-    return;
+    return $event->error_reply("Sorry, the board can't be changed right now!");
   }
 
   my $tokens = $self->_updated_tokens_for($user);
 
   unless ($tokens > 0) {
-    $event->error_reply("Sorry, you don't have any tokens!");
-    return;
+    return $event->error_reply("Sorry, you don't have any tokens!");
   }
 
   my $res_f = $self->_post_payload($payload);
@@ -983,7 +842,7 @@ sub _pay_to_post_payload ($self, $event, $user, $payload) {
         "posted update to Vestaboard API, status: %s",
         $res->status_line,
       ]);
-      $event->reply("Board update posted!");
+      my $reply_f = $event->reply("Board update posted!");
 
       my $state = $self->_user_state->{ $user->username } //= {};
       $state->{tokens}{count} = $tokens - 1;
@@ -1001,11 +860,11 @@ sub _pay_to_post_payload ($self, $event, $user, $payload) {
       }
 
       $self->save_state;
-      return Future->done;
+      return $reply_f;
     })
     ->else(sub {
-      $event->reply_error("Sorry, something went wrong trying to post!");
-    })->retain;
+      return $event->reply_error("Sorry, something went wrong trying to post!");
+    });
 }
 
 sub _updated_tokens_for ($self, $user) {
