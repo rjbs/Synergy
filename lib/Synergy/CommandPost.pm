@@ -196,7 +196,7 @@ sub _generate_command_system ($class, $, $arg, $) {
     },
     help => sub ($name, $arg, $text = undef) {
       # Can be called as help(foo => "Text") or help(foo => {...} => "Text")
-      if (! defined) {
+      if (! defined $text) {
         $text = $arg;
         $arg  = {};
       }
