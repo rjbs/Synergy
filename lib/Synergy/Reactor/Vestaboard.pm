@@ -822,49 +822,48 @@ sub _post_payload ($self, $payload) {
   );
 }
 
-sub _pay_to_post_payload ($self, $event, $user, $payload) {
+async sub _pay_to_post_payload ($self, $event, $user, $payload) {
   my $lock = $self->current_lock;
   if ($lock && $lock->{locked_by} ne $user->username) {
-    return $event->error_reply("Sorry, the board can't be changed right now!");
+    return await $event->error_reply("Sorry, the board can't be changed right now!");
   }
 
   my $tokens = $self->_updated_tokens_for($user);
 
   unless ($tokens > 0) {
-    return $event->error_reply("Sorry, you don't have any tokens!");
+    return await $event->error_reply("Sorry, you don't have any tokens!");
   }
 
-  my $res_f = $self->_post_payload($payload);
+  my $res = eval { await $self->_post_payload($payload) };
 
-  return $res_f
-    ->then(sub ($res) {
-      $Logger->log([
-        "posted update to Vestaboard API, status: %s",
-        $res->status_line,
-      ]);
-      my $reply_f = $event->reply("Board update posted!");
+  unless ($res) {
+    $Logger->log([ "failed to post update to Vestaboard API: %s", $@ ]);
+    return await $event->reply_error("Sorry, something went wrong trying to post!");
+  }
 
-      my $state = $self->_user_state->{ $user->username } //= {};
-      $state->{tokens}{count} = $tokens - 1;
+  $Logger->log([
+    "posted update to Vestaboard API, status: %s",
+    $res->status_line,
+  ]);
 
-      $self->_set_lock_state({
-        locked_by   => $user->username,
-        expires_at  => int(time + ($self->token_regen_period / 2)),
-      });
+  my $state = $self->_user_state->{ $user->username } //= {};
+  $state->{tokens}{count} = $tokens - 1;
 
-      if ($payload->{characters}) {
-        # We might have "text" which we'll ignore for now.  Later, we can make
-        # the text-posting command build characters locally instead of using
-        # the text-posting Vestaboard API. -- rjbs, 2021-09-04
-        $self->_set_current_characters($payload->{characters});
-      }
+  $self->_set_lock_state({
+    locked_by   => $user->username,
+    expires_at  => int(time + ($self->token_regen_period / 2)),
+  });
 
-      $self->save_state;
-      return $reply_f;
-    })
-    ->else(sub {
-      return $event->reply_error("Sorry, something went wrong trying to post!");
-    });
+  if ($payload->{characters}) {
+    # We might have "text" which we'll ignore for now.  Later, we can make
+    # the text-posting command build characters locally instead of using
+    # the text-posting Vestaboard API. -- rjbs, 2021-09-04
+    $self->_set_current_characters($payload->{characters});
+  }
+
+  $self->save_state;
+
+  return await $event->reply("Board update posted!");
 }
 
 sub _updated_tokens_for ($self, $user) {
