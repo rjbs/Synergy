@@ -5,7 +5,7 @@ use utf8;
 
 use Moose;
 use DateTime;
-with 'Synergy::Role::Reactor::EasyListening';
+with 'Synergy::Role::Reactor::CommandPost';
 
 use namespace::clean;
 
@@ -15,93 +15,11 @@ use JMAP::Tester;
 use JSON::MaybeXS;
 use Lingua::EN::Inflect qw(NUMWORDS PL_N);
 use List::Util qw(uniq);
+use Synergy::CommandPost;
 use Synergy::Logger '$Logger';
 use Synergy::Rototron;
-use Synergy::Util qw(expand_date_range parse_date_for_user);
+use Synergy::Util qw(expand_date_range parse_date_for_user reformat_help);
 use Try::Tiny;
-
-sub listener_specs {
-  return (
-    {
-      name      => 'duty',
-      method    => 'handle_duty',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /^duty(?:\s|$)/i },
-
-      help_entries => [
-        {
-          title => 'duty',
-          text  => <<'EOH' =~ s/(\S)\n([^\s•])/$1 $2/rg
-The *duty* command tells you who is on duty for various duty rotations.  For
-more information on duty rotations, see *help rotors*.
-EOH
-        },
-      ],
-    },
-    {
-      name      => 'replan',
-      method    => 'handle_replan',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /\Areplan rotors\z/i },
-      allow_empty_help => 1,
-    },
-    {
-      name      => 'rotors',
-      method    => 'handle_rotors',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /\Arotors\z/i },
-
-      help_entries => [
-        {
-          title => 'rotors',
-          text  => <<'EOH' =~ s/(\S)\n([^\s•])/$1 $2/rg
-The *rotors* command lists all duty rotations managed by Synergy.  A duty
-rotation represents a job that gets done by different people at different
-times, based on some schedule.  To see who's on duty for various rotations, now
-or at some future time, use the *duty* command.
-
-To tell Synergy that you're not available (or are available) on a given day,
-you can say either:
-
-• `{available,unavailable}` on `YYYY-MM-DD`
-• `{available,unavailable}` from `YYYY-MM-DD` to `YYYY-MM-DD`
-
-If you're an admin, you can set other user's availability:
-
-• `USER` is `{available,unavailable}` on `YYYY-MM-DD`
-• `USER` is `{available,unavailable}` from `YYYY-MM-DD` to `YYYY-MM-DD`
-
-To manually assign someone to a duty rotation, you can say either:
-
-• assign rotor `ROTOR` to `USER` on `YYYY-MM-DD`
-• assign rotor `ROTOR` to `USER` from `YYYY-MM-DD` to `YYYY-MM-DD`
-EOH
-        }
-      ],
-    },
-    {
-      name      => 'unavailable',
-      method    => 'handle_set_availability',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /^(?:(\S+)\s+is\s+)?(un)?available\b/in },
-      allow_empty_help => 1,  # handled above
-    },
-    {
-      name      => 'manual_assignment',
-      method    => 'handle_manual_assignment',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) {
-        $e->text =~ /^assign rotor (\S+) to (\S+) /ni;
-      },
-      allow_empty_help => 1,  # handled above
-    },
-  );
-}
 
 has roto_config_path => (
   is => 'ro',
@@ -124,47 +42,50 @@ after register_with_hub => sub ($self, @) {
   $self->rototron; # crash early, crash often -- rjbs, 2019-01-31
 };
 
-sub handle_manual_assignment ($self, $event) {
-  my ($username, $rotor_name, $from, $to);
+my $YMD_RE = qr{ [0-9]{4} - [0-9]{2} - [0-9]{2} }x;
 
-  my $ymd_re = qr{ [0-9]{4} - [0-9]{2} - [0-9]{2} }x;
-  if ($event->text =~ /^assign rotor (\S+) to (\S+) on ($ymd_re)\z/) {
-    $rotor_name = $1;
-    $username   = $2;
-    $from       = parse_date_for_user($3, $event->from_user);
-    $to         = parse_date_for_user($3, $event->from_user);
-  } elsif ($event->text =~ /^assign rotor (\S+) to (\S+) from ($ymd_re) to ($ymd_re)\z/) {
-    $rotor_name = $1;
-    $username   = $2;
-    $from       = parse_date_for_user($3, $event->from_user);
-    $to         = parse_date_for_user($4, $event->from_user);
-  } else {
+responder 'assign-rotor' => {
+  exclusive => 1,
+  targeted  => 1,
+  skip_help => 1, # documented under "rotors"
+  matcher   => sub ($self, $text, $event) {
+    if ($text =~ /^assign rotor (\S+) to (\S+) on ($YMD_RE)\z/) {
+      return [ $1, $2, $3, $3 ];
+    }
+
+    if ($text =~ /^assign rotor (\S+) to (\S+) from ($YMD_RE) to ($YMD_RE)\z/) {
+      return [ $1, $2, $3, $4 ];
+    }
+
     return;
-  }
-
+  },
+} => async sub ($self, $event, $rotor_name, $username, $from_ymd, $to_ymd) {
   $event->mark_handled;
 
   unless (grep {; $_->name eq $rotor_name } $self->rototron->rotors) {
-    return $event->error_reply("I don't know a rotor with that name.");
+    return await $event->error_reply("I don't know a rotor with that name.");
   }
 
+  my $from = parse_date_for_user($from_ymd, $event->from_user);
+  my $to   = parse_date_for_user($to_ymd,   $event->from_user);
+
   unless ($from && $to) {
-    return $event->error_reply(
+    return await $event->error_reply(
       "I had problems understanding the dates in your *assign rotor* command.",
     );
   }
 
   my @dates = expand_date_range($from, $to);
 
-  unless (@dates) { return $event->error_reply("That range didn't make sense."); }
-  if (@dates > 28) { return $event->error_reply("That range is too large."); }
+  unless (@dates) { return await $event->error_reply("That range didn't make sense."); }
+  if (@dates > 28) { return await $event->error_reply("That range is too large."); }
 
   my $assign_to;
   if ($username ne '*') {
     my $target = $self->resolve_name($username, $event->from_user);
 
     unless ($target) {
-      return $event->error_reply("I don't know who you wanted to assign the rotor to.");
+      return await $event->error_reply("I don't know who you wanted to assign the rotor to.");
     }
 
     $assign_to = $target->username;
@@ -174,41 +95,50 @@ sub handle_manual_assignment ($self, $event) {
     $rotor_name => { map {; $_->ymd => $assign_to } @dates },
   });
 
-  $event->reply(
+  await $event->reply(
     sprintf "I updated the assignments on that rotor for %s %s.",
       NUMWORDS(0+@dates),
       PL_N('day', 0+@dates),
   );
 
   $self->_replan_range($dates[0], $dates[-1]);
-}
 
-sub handle_set_availability ($self, $event) {
+  return;
+};
+
+responder 'set-availability' => {
+  exclusive => 1,
+  targeted  => 1,
+  skip_help => 1, # documented under "rotors"
+  matcher   => sub ($self, $text, $event) {
+    return [] if $text =~ /^(?:(\S+)\s+is\s+)?(un)?available\b/in;
+    return;
+  },
+} => async sub ($self, $event) {
   $event->mark_handled;
 
   my ($from, $to);
-  my $ymd_re = qr{ [0-9]{4} - [0-9]{2} - [0-9]{2} }x;
 
   my $target = $event->from_user;
   if ($event->text =~ /^(\S+)\s+is\s+/) {
     $target = $self->resolve_name($1, $event->from_user);
     unless ($target) {
-      return $event->error_reply("Sorry, I don't know who you mean.");
+      return await $event->error_reply("Sorry, I don't know who you mean.");
     }
   }
 
   my $text = $event->text;
   my $adj  = $text =~ /unavailable/i ? 'unavailable' : 'available';
 
-  if ($text =~ m{\bon\s+($ymd_re)\z}) {
+  if ($text =~ m{\bon\s+($YMD_RE)\z}) {
     $from = parse_date_for_user("$1", $event->from_user);
     $to   = $from->clone;
-  } elsif ($text =~ m{\bfrom\s+($ymd_re)\s+to\s+($ymd_re)\z}) {
+  } elsif ($text =~ m{\bfrom\s+($YMD_RE)\s+to\s+($YMD_RE)\z}) {
     my ($d1, $d2) = ($1, $2);
     $from = parse_date_for_user($d1, $event->from_user);
     $to   = parse_date_for_user($d2, $event->from_user);
   } else {
-    return $event->error_reply(
+    return await $event->error_reply(
       "It's: `$adj on YYYY-MM-DD` "
       . "or `$adj from YYYY-MM-DD to YYYY-MM-DD`"
     );
@@ -219,8 +149,8 @@ sub handle_set_availability ($self, $event) {
 
   my @dates = expand_date_range($from, $to);
 
-  unless (@dates) { return $event->error_reply("That range didn't make sense."); }
-  if (@dates > 28) { return $event->error_reply("That range is too large."); }
+  unless (@dates) { return await $event->error_reply("That range didn't make sense."); }
+  if (@dates > 28) { return await $event->error_reply("That range is too large."); }
 
   my $method = qq{set_user_$adj\_on};
   for my $date (@dates) {
@@ -231,7 +161,7 @@ sub handle_set_availability ($self, $event) {
     );
   }
 
-  $event->reply(
+  await $event->reply(
     sprintf "I marked %s %s on %s %s.",
       ($target->username eq $event->from_user->username
         ? 'you'
@@ -242,14 +172,23 @@ sub handle_set_availability ($self, $event) {
   );
 
   $self->_replan_range($dates[0], $dates[-1]);
-}
 
-sub handle_replan ($self, $event) {
-  return unless $event->text =~ /\Areplan rotors\z/i;
+  return;
+};
+
+responder 'replan-rotors' => {
+  exclusive => 1,
+  targeted  => 1,
+  skip_help => 1,
+  matcher   => sub ($self, $text, $event) {
+    return [] if $text =~ /\Areplan rotors\z/i;
+    return;
+  },
+} => async sub ($self, $event) {
   $event->mark_handled;
   $self->_plan_the_future;
-  $event->reply("Okay, I've replanned upcoming duty rotations!");
-}
+  return await $event->reply("Okay, I've replanned upcoming duty rotations!");
+};
 
 sub _replan_range ($self, $from_dt, $to_dt) {
   my $plan = $self->rototron->compute_rotor_update($from_dt, $to_dt);
@@ -322,32 +261,54 @@ sub _user_from_duty ($self, $duty) {
   return $self->hub->user_directory->user_named($username);
 }
 
-sub handle_rotors ($self, $event) {
-  $event->mark_handled;
+command rotors => {
+  help => reformat_help(<<~'EOH'),
+    The *rotors* command lists all duty rotations managed by Synergy.  A duty
+    rotation represents a job that gets done by different people at different
+    times, based on some schedule.  To see who's on duty for various rotations, now
+    or at some future time, use the *duty* command.
 
+    To tell Synergy that you're not available (or are available) on a given day,
+    you can say either:
+
+    • `{available,unavailable}` on `YYYY-MM-DD`
+    • `{available,unavailable}` from `YYYY-MM-DD` to `YYYY-MM-DD`
+
+    If you're an admin, you can set other user's availability:
+
+    • `USER` is `{available,unavailable}` on `YYYY-MM-DD`
+    • `USER` is `{available,unavailable}` from `YYYY-MM-DD` to `YYYY-MM-DD`
+
+    To manually assign someone to a duty rotation, you can say either:
+
+    • assign rotor `ROTOR` to `USER` on `YYYY-MM-DD`
+    • assign rotor `ROTOR` to `USER` from `YYYY-MM-DD` to `YYYY-MM-DD`
+    EOH
+} => async sub ($self, $event, $) {
   my @lines;
   for my $rotor (sort {; fc $a->name cmp fc $b->name } $self->rototron->rotors) {
     push @lines, sprintf '• %s — %s', $rotor->name, $rotor->description;
   }
 
   my $text = join qq{\n}, @lines;
-  $event->reply(
+  return await $event->reply(
     "Known duty rotations:\n$text",
     { slack => "*Known duty rotations:*\n$text" }
   );
-}
+};
 
-sub handle_duty ($self, $event) {
-  $event->mark_handled;
-
-  my (undef, $when) = split /\s+/, $event->text, 2;
-
+command duty => {
+  help => reformat_help(<<~'EOH'),
+    The *duty* command tells you who is on duty for various duty rotations.  For
+    more information on duty rotations, see *help rotors*.
+    EOH
+} => async sub ($self, $event, $when) {
   my $when_dt;
   my $is_now;
 
   if ($when) {
     $when_dt = eval { parse_date_for_user($when, $event->from_user) };
-    return $event->error_reply("I didn't understand the day you asked about")
+    return await $event->error_reply("I didn't understand the day you asked about")
       unless $when_dt;
   } else {
     $is_now = 1;
@@ -377,15 +338,14 @@ sub handle_duty ($self, $event) {
 
   unless (@lines) {
     my $str = $is_now ? q{today} : q{that time};
-    $event->reply("Like booze in an airport, $str is duty free.");
-    return;
+    return await $event->reply("Like booze in an airport, $str is duty free.");
   }
 
   my $reply = "*Duty roster for " . $when_dt->ymd . ":*\n"
             . join qq{\n}, sort @lines;
 
-  $event->reply($reply);
-}
+  return await $event->reply($reply);
+};
 
 async sub start ($self) {
   my $timer = IO::Async::Timer::Periodic->new(

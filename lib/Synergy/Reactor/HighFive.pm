@@ -3,13 +3,15 @@ use utf8;
 package Synergy::Reactor::HighFive;
 
 use Moose;
-with 'Synergy::Role::Reactor::EasyListening';
-with 'Synergy::Role::HTTPEndpoint';
+with 'Synergy::Role::Reactor::CommandPost',
+     'Synergy::Role::HTTPEndpoint';
 
 use namespace::clean;
+use Synergy::CommandPost;
 use Synergy::Logger '$Logger';
 
 use DBI;
+use Future::AsyncAwait;
 use JSON::MaybeXS qw(encode_json);
 
 has '+http_path' => (
@@ -126,20 +128,17 @@ sub http_app ($self, $env) {
   ];
 }
 
-sub listener_specs {
-  return {
-    name      => 'highfive',
-    method    => 'highfive',
-    targeted  => 1,
-    predicate => sub ($, $e) {
-      $e->text =~ /^(highfive|:raised_hands:(?::skin-tone-\d:)?|$HIGHFIVE_EMOJI)\s/in;
-    },
-    help_entries => [{
-      title => 'highfive',
-      text => '*highfive WHO: REASON* - give someone a high five for a job well done',
-    }],
-  };
-}
+responder highfive => {
+  targeted  => 1,
+  help      => '*highfive WHO: REASON* - give someone a high five for a job well done',
+  matcher   => sub ($self, $text, $event) {
+    return [] if $text =~ /^(highfive|:raised_hands:(?::skin-tone-\d:)?|$HIGHFIVE_EMOJI)\s/in;
+    return;
+  },
+} => async sub ($self, $event) {
+  $self->highfive($event);
+  return;
+};
 
 sub highfive ($self, $event, $arg = {}) {
   $event->mark_handled;

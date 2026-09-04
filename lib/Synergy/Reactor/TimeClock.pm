@@ -2,14 +2,16 @@ use v5.36.0;
 package Synergy::Reactor::TimeClock;
 
 use Moose;
-with 'Synergy::Role::Reactor::EasyListening',
+with 'Synergy::Role::Reactor::CommandPost',
      'Synergy::Role::HasPreferences',
      ;
 
 use namespace::clean;
 
+use Synergy::CommandPost;
 use Synergy::Logger '$Logger';
 use Synergy::Util qw(bool_from_text describe_business_hours);
+use Synergy::X;
 
 use DBI;
 use Future::AsyncAwait;
@@ -17,68 +19,6 @@ use IO::Async::Timer::Periodic;
 use List::Util qw(max);
 
 use utf8;
-
-sub listener_specs {
-  return (
-    {
-      name      => 'now_working',
-      method    => 'handle_now_working',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /\Anow\s+working\s*\z/i; },
-      help_entries => [
-        {
-          title => 'now working',
-          text  => "*now working*: list everyone who's currently on the clock",
-        },
-      ],
-    },
-    {
-      name      => 'hours_for',
-      method    => 'handle_hours_for',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /\Ahours(\s+for)?\s+/i; },
-      help_entries => [
-        {
-          title => 'hours',
-          text  => "*hours PERSON* (or *hours for PERSON*): find out when PERSON is likely to be working",
-        },
-      ],
-    },
-    {
-      name      => 'clock_out',
-      method    => 'handle_clock_out',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { $e->text =~ /\Aclock\s*(?:out|off):/; },
-      help_entries => [
-        {
-          title => 'clock out',
-          text  => "*clock out: `[REPORT]`*: declare you're done for the day and file a brief report about it",
-        },
-        {
-          title => 'clock off',
-          text  => 'see *clock out*',
-          unlisted => 1,
-        },
-      ],
-    },
-    {
-      name      => 'recent_clockouts',
-      method    => 'handle_recent_clockouts',
-      exclusive => 1,
-      targeted  => 1,
-      predicate => sub ($self, $e) { lc $e->text eq 'recent clockouts'; },
-      help_entries => [
-        {
-          title => 'clockouts',
-          text  => '*recent clockouts*: give a summary of clockouts for the past 48h',
-        },
-      ],
-    },
-  );
-}
 
 has primary_channel_name => (
   is  => 'ro',
@@ -166,7 +106,16 @@ has _timeclock_dbh => (
   },
 );
 
-sub handle_now_working ($self, $event) {
+responder 'now-working' => {
+  exclusive   => 1,
+  targeted    => 1,
+  help_titles => [ 'now working' ],
+  help        => "*now working*: list everyone who's currently on the clock",
+  matcher     => sub ($self, $text, $event) {
+    return [] if $text =~ /\Anow\s+working\s*\z/i;
+    return;
+  },
+} => async sub ($self, $event) {
   $event->mark_handled;
 
   my $moment = DateTime->now;
@@ -201,11 +150,11 @@ sub handle_now_working ($self, $event) {
   }
 
   unless (@at_home || @in_office) {
-    return $event->reply("How about that!  Nobody's working right now.");
+    return await $event->reply("How about that!  Nobody's working right now.");
   }
 
   if ($event->is_public) {
-    $event->reply("I don't want to ping everybody who's working, so I've replied in private.");
+    await $event->reply("I don't want to ping everybody who's working, so I've replied in private.");
   }
 
   my $text = q{};
@@ -218,43 +167,61 @@ sub handle_now_working ($self, $event) {
     $text .= "\N{HOUSE WITH GARDEN} " . (join q{, }, @at_home) . "\n";
   }
 
-  $event->private_reply("Currently on the clock:\n$text");
-}
+  return await $event->private_reply("Currently on the clock:\n$text");
+};
 
-sub handle_hours_for ($self, $event) {
-  $event->mark_handled;
+command hours => {
+  help   => "*hours PERSON* (or *hours for PERSON*): find out when PERSON is likely to be working",
+  parser => sub ($self, $rest, $event) {
+    my ($who) = ($rest // q{}) =~ /\A(?:for\s+)?(\S+)\s*\z/i;
 
-  my ($who) = $event->text =~ /\Ahours(?:\s+for)?\s+(\S+)\s*\z/i;
+    Synergy::X->throw_public("It's: *hours `PERSON`* or *hours for `PERSON`*.")
+      unless $who;
 
+    return [ $who ];
+  },
+} => async sub ($self, $event, $who) {
   my $target = $self->resolve_name($who, $event->from_user);
 
   unless ($target) {
-    return $event->reply_error("Sorry, I don't know who that is.");
+    return await $event->error_reply("Sorry, I don't know who that is.");
   }
 
   my $tz = $target->time_zone;
   my $tz_nick = $self->hub->env->time_zone_names->{ $tz } // $tz;
 
-
-  return $event->reply(
+  return await $event->reply(
     sprintf "%s's usual hours (%s): %s",
       $target->username,
       $tz_nick,
       describe_business_hours($target->business_hours, $target),
   );
-}
+};
 
-sub handle_clock_out ($self, $event) {
+help 'clock out' => "*clock out: `[REPORT]`*: declare you're done for the day and file a brief report about it";
+help 'clock off' => { unlisted => 1 } => 'see *clock out*';
+
+responder 'clock-out' => {
+  exclusive => 1,
+  targeted  => 1,
+  skip_help => 1, # provided by "help clock out"
+  matcher   => sub ($self, $text, $event) {
+    return unless $text =~ /\Aclock\s*(out|off):(.*)\z/is;
+
+    my ($which, $comment) = ($1, $2);
+    $comment =~ s/\A\s+//;
+
+    return [ $which, (length $comment ? $comment : undef) ];
+  },
+} => async sub ($self, $event, $w2, $comment) {
   $event->mark_handled;
 
-  my ($w2, $comment) = $event->text =~ /^clock\s*(out|off):\s*(\S.+)\z/is;
-
   unless ($comment) {
-    return $event->error_reply("To clock \L$w2\E, it's: *clock \L$w2\E: `SUMMARY`*.");
+    return await $event->error_reply("To clock \L$w2\E, it's: *clock \L$w2\E: `SUMMARY`*.");
   }
 
   unless ($event->from_user) {
-    return $event->error_reply("I don't know who you are, so you can't clock \L$w2\E.");
+    return await $event->error_reply("I don't know who you are, so you can't clock \L$w2\E.");
   }
 
   $self->_timeclock_dbh->do(
@@ -277,13 +244,22 @@ sub handle_clock_out ($self, $event) {
   }
 
   if ($event->is_public) {
-    return $event->reply("See you later!");
+    return await $event->reply("See you later!");
   }
 
-  return $event->reply("See you later! Next time, consider clocking \L$w2\E in public!");
-}
+  return await $event->reply("See you later! Next time, consider clocking \L$w2\E in public!");
+};
 
-sub handle_recent_clockouts ($self, $event) {
+responder 'recent-clockouts' => {
+  exclusive   => 1,
+  targeted    => 1,
+  help_titles => [ 'clockouts' ],
+  help        => '*recent clockouts*: give a summary of clockouts for the past 48h',
+  matcher     => sub ($self, $text, $event) {
+    return [] if lc $text eq 'recent clockouts';
+    return;
+  },
+} => async sub ($self, $event) {
   $event->mark_handled;
 
   my $reports = $self->_timeclock_dbh->selectall_arrayref(
@@ -310,12 +286,12 @@ sub handle_recent_clockouts ($self, $event) {
 
   chomp $text;
 
-  $event->reply(
+  return await $event->reply(
     $text
       ? "*Recent Clockings Out*\n$text"
       : "There have been no recent clockings out!"
   );
-}
+};
 
 sub has_clocked_out_report ($self, $who, $arg = {}) {
   my $recent = $self->_timeclock_dbh->selectall_arrayref(
