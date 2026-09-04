@@ -51,24 +51,24 @@ async sub send_message_to_user ($self, $user, $text, $alts = {}) {
   );
 }
 
-sub send_message ($self, $address, $text, $alts = {}) {
+async sub send_message ($self, $address, $text, $alts = {}) {
   my @lines = split /\n/, $text;
 
-  my $now = Future->done; # The Future is Now!
+  my $ok = eval {
+    for my $line (@lines) {
+      next unless length $line; # I'm not sure this is what I want to do.
+      $line = Encode::encode('utf-8', $line);
+      await $self->client->do_PRIVMSG(target => $address, text => $line);
+    }
 
-  for my $line (@lines) {
-    next unless length $line; # I'm not sure this is what I want to do.
-    $line = Encode::encode('utf-8', $line);
-    my $now = $now->retain->then(sub {
-      $self->client->do_PRIVMSG(target => $address, text => $line);
-    });
+    1;
+  };
+
+  unless ($ok) {
+    $Logger->log([ "IRC: error sending response: %s", $@ ]);
   }
 
-  return $now->else(sub {
-    my (@error) = @_;
-    $Logger->log([ "IRC: error sending response: %s", \@error ]);
-    return Future->done;
-  });
+  return;
 }
 
 with 'Synergy::Role::Channel';

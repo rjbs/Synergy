@@ -2,6 +2,7 @@ use v5.36.0;
 package Synergy::Channel::Twilio;
 
 use Moose;
+use Future::AsyncAwait;
 use JSON::MaybeXS qw(encode_json decode_json);
 
 use Synergy::Logger '$Logger';
@@ -110,7 +111,7 @@ sub http_post {
   return $self->hub->http_request('POST' => @_);
 }
 
-sub send_message_to_user ($self, $user, $text, $alts = {}) {
+async sub send_message_to_user ($self, $user, $text, $alts = {}) {
   my $phone = $user->identity_for($self->name) // $user->phone;
 
   unless ($phone) {
@@ -122,14 +123,14 @@ sub send_message_to_user ($self, $user, $text, $alts = {}) {
   }
 
   $Logger->log([ "sending text <$text> to $phone" ]);
-  $self->send_message($phone, $text, $alts);
+  return await $self->send_message($phone, $text, $alts);
 }
 
 my %LANGUAGE_FOR = (
   61 => 'en-AU',
 );
 
-sub send_message ($self, $target, $text, $alts = {}) {
+async sub send_message ($self, $target, $text, $alts = {}) {
   my $from = $self->from;
 
   my $picked_code;
@@ -176,15 +177,17 @@ sub send_message ($self, $target, $text, $alts = {}) {
     );
   }
 
-  return $res_f->then(sub ($res) {
-    if ($res->is_success) {
-      my $req_id   = $res->header('Twilio-Request-Id');
-      my $res_json = $res->decoded_content;
-      $Logger->log("sent sms to $target as req $req_id; response JSON: $res_json");
-    } else {
-      $Logger->log("failed to send sms to $target: " . $res->as_string);
-    }
-  })->retain;
+  my $res = await $res_f;
+
+  if ($res->is_success) {
+    my $req_id   = $res->header('Twilio-Request-Id');
+    my $res_json = $res->decoded_content;
+    $Logger->log("sent sms to $target as req $req_id; response JSON: $res_json");
+  } else {
+    $Logger->log("failed to send sms to $target: " . $res->as_string);
+  }
+
+  return;
 }
 
 sub describe_event ($self, $event) {

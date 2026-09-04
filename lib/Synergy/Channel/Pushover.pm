@@ -26,7 +26,7 @@ sub http_post {
   return $self->hub->http_request('POST' => @_);
 }
 
-sub send_message_to_user ($self, $user, $text, $alts = {}) {
+async sub send_message_to_user ($self, $user, $text, $alts = {}) {
   my $where = $user->identity_for($self->name);
   my $who = $user->username;
 
@@ -39,20 +39,18 @@ sub send_message_to_user ($self, $user, $text, $alts = {}) {
   }
 
   $Logger->log([ "sending pushover <$text> to $who" ]);
-  $self->send_message($where, $text, $alts);
+  return await $self->send_message($where, $text, $alts);
 }
 
-sub send_message ($self, $target, $text, $alts = {}) {
-  my $from;
-
-  my $res = $self->http_post(
+async sub send_message ($self, $target, $text, $alts = {}) {
+  my $res = await $self->http_post(
     "https://api.pushover.net/1/messages.json",
     Content => [
       token   => $self->token,
       user    => $target,
       message => $text,
     ],
-  )->get;
+  );
 
   unless ($res->is_success) {
     $Logger->log("failed to send pushover to $target: " . $res->as_string);
