@@ -222,25 +222,22 @@ responder cat_pic => {
     return unless $text =~ /\Acat(?:\s+(pic|jpg|gif|png))?\z/i;
     return [ $1 || 'jpg,gif,png' ];
   },
-}, sub ($self, $event, $fmt) {
+}, async sub ($self, $event, $fmt) {
   $event->mark_handled;
 
   $fmt = q{jpg,gif,png} if $fmt eq 'pic';
 
-  my $http_future = $self->hub->http_client->GET(
+  my $res = await $self->hub->http_client->GET(
     "https://api.thecatapi.com/api/images/get?format=src&type=$fmt",
     max_redirects => 0,
   );
 
-  return $http_future->on_done(sub ($res) {
-    if ($res->code =~ /\A3..\z/) {
-      my $loc = $res->header('Location');
-      $event->reply($loc);
-      return;
-    }
+  if ($res->code =~ /\A3..\z/) {
+    my $loc = $res->header('Location');
+    return await $event->reply($loc);
+  }
 
-    $event->reply("Something went wrong getting the kitties! \N{CRYING CAT FACE}");
-  });
+  return await $event->reply("Something went wrong getting the kitties! \N{CRYING CAT FACE}");
 };
 
 responder capybara_pic => {
