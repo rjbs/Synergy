@@ -154,13 +154,35 @@ around '_set_oncall_list' => sub ($orig, $self, @rest) {
   $self->save_state;
 };
 
+=head2 _tick_and_log
+
+  on_tick => sub { $self->_tick_and_log('_check_at_oncall') },
+
+Timers throw away whatever their C<on_tick> returns, so a periodic check that's
+an async sub needs someone to hold onto its future and to notice when it fails.
+This runs the named method, keeps the future alive, and logs a failure rather
+than letting it vanish.
+
+=cut
+
+sub _tick_and_log ($self, $method) {
+  $self->$method
+    ->else(sub (@failure) {
+      $Logger->log([ "PagerDuty error in %s: %s", $method, \@failure ]);
+      return Future->done;
+    })
+    ->retain;
+
+  return;
+}
+
 async sub start ($self) {
   if ($self->oncall_channel && $self->oncall_group_address) {
     my $check_oncall_timer = IO::Async::Timer::Periodic->new(
       notifier_name  => 'pagerduty-oncall',
       first_interval => 30,   # don't start immediately
       interval       => 150,
-      on_tick        => sub { $self->_check_at_oncall },
+      on_tick        => sub { $self->_tick_and_log('_check_at_oncall') },
     );
 
     $check_oncall_timer->start;
@@ -172,7 +194,7 @@ async sub start ($self) {
         notifier_name  => 'pagerduty-maint',
         first_interval => 45,
         interval => $self->maint_timer_interval,
-        on_tick  => sub {  $self->_check_long_maint },
+        on_tick  => sub { $self->_tick_and_log('_check_long_maint') },
       );
       $maint_warning_timer->start;
       $self->hub->loop->add($maint_warning_timer);
@@ -681,7 +703,7 @@ sub _pd_request_for_user ($self, $user, $method, $endpoint, $data = undef) {
   return $self->_pd_request($method => $endpoint, $data, $token);
 }
 
-sub _pd_request ($self, $method, $endpoint, $data = undef, $token = undef) {
+async sub _pd_request ($self, $method, $endpoint, $data = undef, $token = undef) {
   my %content;
 
   if ($data) {
@@ -691,22 +713,20 @@ sub _pd_request ($self, $method, $endpoint, $data = undef, $token = undef) {
     );
   }
 
-  return $self->hub->http_request(
+  my $res = await $self->hub->http_request(
     $method,
     $self->_url_for($endpoint),
     Authorization => 'Token token=' . ($token // $self->api_key),
     Accept        => 'application/vnd.pagerduty+json;version=2',
     %content,
-  )->then(sub ($res) {
-    unless ($res->is_success) {
-      my $code = $res->code;
-      $Logger->log([ "error talking to PagerDuty: %s", $res->as_string ]);
-      return Future->fail($res->as_string, 'http', { http_res => $res });
-    }
+  );
 
-    my $data = decode_json($res->content);
-    return Future->done($data);
-  });
+  unless ($res->is_success) {
+    $Logger->log([ "error talking to PagerDuty: %s", $res->as_string ]);
+    return await Future->fail($res->as_string, 'http', { http_res => $res });
+  }
+
+  return decode_json($res->content);
 }
 
 after register_with_hub => sub ($self, @) {
@@ -720,23 +740,22 @@ after register_with_hub => sub ($self, @) {
   }
 };
 
-sub _relevant_maint_windows ($self) {
-  return $self->_pd_request('GET' => '/maintenance_windows?filter=ongoing')
-    ->then(sub ($data) {
-      my $maint = $data->{maintenance_windows} // [];
+async sub _relevant_maint_windows ($self) {
+  my $data = await $self->_pd_request('GET' => '/maintenance_windows?filter=ongoing');
 
-      # create a search/lookup hash
-      my %services = map {; $_ => 1} $self->service_ids->@*;
+  my $maint = $data->{maintenance_windows} // [];
 
-      # We only care if maint window covers a service we care about.
-      my @relevant;
-      for my $window (@$maint) {
-        next unless grep {; $services{$_->{id}} } $window->{services}->@*;
-        push @relevant, $window;
-      }
+  # create a search/lookup hash
+  my %services = map {; $_ => 1} $self->service_ids->@*;
 
-      return Future->done(@relevant);
-    });
+  # We only care if maint window covers a service we care about.
+  my @relevant;
+  for my $window (@$maint) {
+    next unless grep {; $services{$_->{id}} } $window->{services}->@*;
+    push @relevant, $window;
+  }
+
+  return @relevant;
 }
 
 sub _format_maints ($self, @maints) {
@@ -752,76 +771,63 @@ sub _format_maint_window ($self, $window) {
   return "$services ($ago, started by $who)";
 }
 
-sub _check_long_maint ($self) {
+async sub _check_long_maint ($self) {
   my $current_time = time();
 
   # No warning if we've warned in last 25 minutes
   return unless ($current_time - $self->last_maint_warning_time) > (60 * 25);
 
-  $self->_relevant_maint_windows
-    ->then(sub (@maint) {
-      unless (@maint) {
-        return Future->fail('not in maint');
-      }
+  my @maint = await $self->_relevant_maint_windows;
 
-      $self->last_maint_warning_time($current_time);
-      $self->save_state;
+  return unless @maint;
 
-      my $oldest;
-      for my $window (@maint) {
-        my $start = $ISO8601->parse_datetime($window->{start_time});
-        my $epoch = $start->epoch;
-        $oldest = $epoch if ! $oldest || $epoch < $oldest;
-      }
+  $self->last_maint_warning_time($current_time);
+  $self->save_state;
 
-      my $maint_duration_s = $current_time - $oldest;
-      return Future->fail('maint duration less than 30m')
-        unless $maint_duration_s > (60 * 30);
+  my $oldest;
+  for my $window (@maint) {
+    my $start = $ISO8601->parse_datetime($window->{start_time});
+    my $epoch = $start->epoch;
+    $oldest = $epoch if ! $oldest || $epoch < $oldest;
+  }
 
-      my $group_address = $self->oncall_group_address;
-      my $maint_duration_m = int($maint_duration_s / 60);
+  my $maint_duration_s = $current_time - $oldest;
+  return unless $maint_duration_s > (60 * 30);
 
-      my $maint_text = $self->_format_maints(@maint);
-      my $text =  "Hey, by the way, PagerDuty is in maintenance mode: $maint_text";
+  my $group_address = $self->oncall_group_address;
 
-      $self->oncall_channel->send_message(
-        $self->maint_warning_address,
-        "\@oncall $text",
-        { slack => "<!subteam^$group_address> $text" }
-      );
-    })
-    ->else(sub {
-      my ($message, $extra) = @_;
-      return if $message eq 'not in maint';
-      return if $message eq 'maint duration less than 30m';
-      $Logger->log([ "PagerDuty error _check_long_maint(): %s", [@_] ]);
-    })->retain;
+  my $maint_text = $self->_format_maints(@maint);
+  my $text =  "Hey, by the way, PagerDuty is in maintenance mode: $maint_text";
+
+  return await $self->oncall_channel->send_message(
+    $self->maint_warning_address,
+    "\@oncall $text",
+    { slack => "<!subteam^$group_address> $text" }
+  );
 }
 
-sub _oncall_tree ($self) {
-
+async sub _oncall_tree ($self) {
   my %should_ignore = map {; $_ => 1 } $self->suppressed_user_ids;
 
-  return $self->_pd_request(GET => '/oncalls?escalation_policy_ids[]=' . $self->escalation_policy_id)
-    ->then(sub ($data) {
+  my $data = await $self->_pd_request(
+    GET => '/oncalls?escalation_policy_ids[]=' . $self->escalation_policy_id
+  );
 
-      my %oncall_tree;
+  my %oncall_tree;
 
-      my @oncalls = grep {; !$should_ignore{$_->{user}{id}} } $data->{oncalls}->@*;
+  my @oncalls = grep {; !$should_ignore{$_->{user}{id}} } $data->{oncalls}->@*;
 
-      for my $oncall (@oncalls) {
-        my $level = $oncall->{escalation_level};
+  for my $oncall (@oncalls) {
+    my $level = $oncall->{escalation_level};
 
-        if (!$oncall_tree{$level}) {
-          $oncall_tree{$level} = [];
-        }
+    if (!$oncall_tree{$level}) {
+      $oncall_tree{$level} = [];
+    }
 
-        push $oncall_tree{$level}->@*, $oncall;
-      }
+    push $oncall_tree{$level}->@*, $oncall;
+  }
 
-      return Future->done(\%oncall_tree);
-    });
-
+  return \%oncall_tree;
 }
 
 # gets all currently on call users and filters for the appropriate escalation level.
@@ -855,16 +861,15 @@ async sub _escalation_oncall_ids ($self) {
 
 # This returns a Future that, when done, gives a boolean as to whether or not
 # $who is oncall right now.
-sub _user_is_oncall ($self, $who) {
-  return $self->_current_oncall_ids
-    ->then(sub (@ids) {
-      my $want_id = $self->get_user_preference($who->username, 'user-id');
-      return Future->done(!! first { $_ eq $want_id } @ids)
-    });
+async sub _user_is_oncall ($self, $who) {
+  my @ids = await $self->_current_oncall_ids;
+
+  my $want_id = $self->get_user_preference($who->username, 'user-id');
+  return !! first { $_ eq $want_id } @ids;
 }
 
 # returns a future that yields a list of incidents
-sub _get_incidents ($self, @statuses) {
+async sub _get_incidents ($self, @statuses) {
   Carp::confess("no statuses found to get!") unless @statuses;
 
   # url params
@@ -881,22 +886,20 @@ sub _get_incidents ($self, @statuses) {
   while (! $is_done) {
     my $url = "/incidents?$services&$statuses&limit=$limit&offset=$offset";
 
-    $self->_pd_request(GET => $url)
-      ->then(sub ($data) {
-        push @results, $data->{incidents}->@*;
+    my $data = await $self->_pd_request(GET => $url);
 
-        $is_done = ! $data->{more};
-        $offset += $limit;
+    push @results, $data->{incidents}->@*;
 
-        if (++$i > 20) {
-          $Logger->log("did more than 20 requests getting incidents from PagerDuty; aborting to avoid infinite loop!");
-          $is_done = 1;
-        }
-      })
-      ->await;
+    $is_done = ! $data->{more};
+    $offset += $limit;
+
+    if (++$i > 20) {
+      $Logger->log("did more than 20 requests getting incidents from PagerDuty; aborting to avoid infinite loop!");
+      $is_done = 1;
+    }
   }
 
-  return Future->done(@results);
+  return @results;
 }
 
 async sub _get_incident_notes ($self, $incident_id) {
@@ -906,9 +909,9 @@ async sub _get_incident_notes ($self, $incident_id) {
   return $notes_data->{notes};
 }
 
-sub _update_status_for_incidents ($self, $who, $status, $incident_ids) {
+async sub _update_status_for_incidents ($self, $who, $status, $incident_ids) {
   # This just prevents some special-casing elsewhere
-  return Future->done unless @$incident_ids;
+  return unless @$incident_ids;
 
   my @todo = @$incident_ids;
   my @incidents;
@@ -923,36 +926,34 @@ sub _update_status_for_incidents ($self, $who, $status, $incident_ids) {
       },
     } @ids;
 
-    $self->_pd_request_for_user(
+    my $data = await $self->_pd_request_for_user(
       $who,
       PUT => '/incidents',
       { incidents => \@put }
-    )->then(sub ($data) {
-      push @incidents, $data->{incidents}->@*;
-    })
-    ->await;
+    );
+
+    push @incidents, $data->{incidents}->@*;
   }
 
-  return Future->done(@incidents);
+  return @incidents;
 }
 
-sub _ack_all ($self, $event) {
-  return $self->_get_incidents(qw(triggered))
-    ->then(sub (@incidents) {
-      my @unacked = map  {; $_->{id} } @incidents;
-      $Logger->log([ "PagerDuty: acking incidents: %s", \@unacked ]);
+async sub _ack_all ($self, $event) {
+  my @incidents = await $self->_get_incidents(qw(triggered));
 
-      return $self->_update_status_for_incidents(
-        $event->from_user,
-        'acknowledged',
-        \@unacked,
-      );
-    })->then(sub (@incidents) {
-      return Future->done(scalar @incidents);
-    });
+  my @unacked = map  {; $_->{id} } @incidents;
+  $Logger->log([ "PagerDuty: acking incidents: %s", \@unacked ]);
+
+  my @acked = await $self->_update_status_for_incidents(
+    $event->from_user,
+    'acknowledged',
+    \@unacked,
+  );
+
+  return scalar @acked;
 }
 
-sub _resolve_incidents ($self, $event, $arg) {
+async sub _resolve_incidents ($self, $event, $arg) {
   my $whose = $arg->{whose};
   my $only_pending = $arg->{only_pending};
   Carp::confess("_resolve_incidents called with bogus args")
@@ -962,120 +963,129 @@ sub _resolve_incidents ($self, $event, $arg) {
 
   my $pending_cutoff = DateTime->now->add(minutes => 30);
 
-  # XXX pagination?
-  return $self->_get_incidents(qw(triggered acknowledged))
-    ->then(sub (@incidents) {
-      my $pd_id = $self->pd_id_from_username($event->from_user->username);
-      my @unresolved;
+  # There's only one thing to say at the end, so the work below picks the
+  # message rather than replying from half a dozen places.  Beware: an early
+  # "return" inside the eval would return from the eval, not from here.
+  my $reply;
 
-      for my $incident (@incidents) {
-        # skip unacked incidents unless we've asked for all
-        next if $only_acked && $incident->{status} eq 'triggered';
+  my $ok = eval {
+    # XXX pagination?
+    my @incidents = await $self->_get_incidents(qw(triggered acknowledged));
 
-        # skip snoozed incidents (incidents with more than 30 minutes to unack)
-        # if set
-        if ($only_pending) {
-          my ($unack_action) = grep {; $_->{type} eq "unacknowledge"} $incident->{pending_actions}->@*;
-          my $unack_time = $ISO8601->parse_datetime($unack_action->{at});
+    my $pd_id = $self->pd_id_from_username($event->from_user->username);
+    my @unresolved;
 
-          next if $unack_time > $pending_cutoff;
-        }
+    for my $incident (@incidents) {
+      # skip unacked incidents unless we've asked for all
+      next if $only_acked && $incident->{status} eq 'triggered';
 
-        # 'resolve own' is 'resolve all the alerts I have acked'
-        if ($whose eq 'own') {
-          next unless grep {; $_->{acknowledger}{id} eq $pd_id }
-                      $incident->{acknowledgements}->@*;
-        }
+      # skip snoozed incidents (incidents with more than 30 minutes to unack)
+      # if set
+      if ($only_pending) {
+        my ($unack_action) = grep {; $_->{type} eq "unacknowledge"} $incident->{pending_actions}->@*;
+        my $unack_time = $ISO8601->parse_datetime($unack_action->{at});
 
-        push @unresolved, $incident->{id};
+        next if $unack_time > $pending_cutoff;
       }
 
-      unless (@unresolved) {
-        $event->reply("Looks like there's no incidents to resolve. Lucky!");
-        return Future->done;
+      # 'resolve own' is 'resolve all the alerts I have acked'
+      if ($whose eq 'own') {
+        next unless grep {; $_->{acknowledger}{id} eq $pd_id }
+                    $incident->{acknowledgements}->@*;
       }
 
+      push @unresolved, $incident->{id};
+    }
+
+    if (! @unresolved) {
+      $reply = "Looks like there's no incidents to resolve. Lucky!";
+    } else {
       $Logger->log([ "PagerDuty: resolving incidents: %s", \@unresolved ]);
 
-      return $self->_update_status_for_incidents(
+      my @resolved = await $self->_update_status_for_incidents(
         $event->from_user,
         'resolved',
         \@unresolved,
       );
-    })->then(sub (@incidents) {
-      return Future->done if ! @incidents;
 
-      my $n = @incidents;
-      my $noun = $n == 1 ? 'incident' : 'incidents';
+      if (@resolved) {
+        my $n = @resolved;
+        my $noun = $n == 1 ? 'incident' : 'incidents';
 
-      my $exclamation = $whose eq 'all' ? "The board is clear!" : "Phew!";
+        my $exclamation = $whose eq 'all' ? "The board is clear!" : "Phew!";
 
-      $event->reply("Successfully resolved $n $noun. $exclamation");
-      return Future->done;
-    })->else(sub (@failure) {
-      $Logger->log(["PagerDuty error resolving incidents: %s", \@failure ]);
-      $event->reply("Something went wrong resolving incidents. Sorry!");
-    });
+        $reply = "Successfully resolved $n $noun. $exclamation";
+      }
+    }
+
+    1;
+  };
+
+  unless ($ok) {
+    $Logger->log([ "PagerDuty error resolving incidents: %s", $@ ]);
+    $reply = "Something went wrong resolving incidents. Sorry!";
+  }
+
+  return unless defined $reply;
+
+  return await $event->reply($reply);
 }
 
-sub _check_at_oncall ($self) {
+async sub _check_at_oncall ($self) {
   my $channel = $self->oncall_channel;
   return unless $channel && $channel->isa('Synergy::Channel::Slack');
 
   $Logger->log("checking PagerDuty for oncall updates");
 
-  return $self->_current_oncall_ids
-    ->then(sub (@ids) {
-      my @new = sort @ids;
-      my @have = sort $self->oncall_list;
+  my @ids = await $self->_current_oncall_ids;
 
-      if (join(',', @have) eq join(',', @new)) {
-        $Logger->log("no changes in oncall list detected");
-        return Future->done;
-      }
+  my @new  = sort @ids;
+  my @have = sort $self->oncall_list;
 
-      $Logger->log([ "will update oncall list; is now %s", join(', ', @new) ]);
+  if (join(',', @have) eq join(',', @new)) {
+    $Logger->log("no changes in oncall list detected");
+    return;
+  }
 
-      my @userids = map  {; $_->identity_for($channel->name) }
-                    map  {; $self->hub->user_directory->user_named($_) }
-                    grep {; defined }
-                    map  {; $self->username_from_pd($_) }
-                    @new;
+  $Logger->log([ "will update oncall list; is now %s", join(', ', @new) ]);
 
-      unless (@userids) {
-        $Logger->log("could not convert PagerDuty oncall list into slack userids; ignoring");
-        return Future->done;
-      }
+  my @userids = map  {; $_->identity_for($channel->name) }
+                map  {; $self->hub->user_directory->user_named($_) }
+                grep {; defined }
+                map  {; $self->username_from_pd($_) }
+                @new;
 
-      my $f = $channel->slack->api_call(
-        'usergroups.users.update',
-        {
-          usergroup => $self->oncall_group_address,
-          users => join(q{,}, @userids),
-        },
-        privileged => 1,
-      );
+  unless (@userids) {
+    $Logger->log("could not convert PagerDuty oncall list into slack userids; ignoring");
+    return;
+  }
 
-      $f->on_done(sub ($http_res) {
-        my $data = decode_json($http_res->decoded_content);
-        unless ($data->{ok}) {
-          $Logger->log(["error updating oncall slack group: %s", $data]);
-          return;
-        }
+  my $http_res = await $channel->slack->api_call(
+    'usergroups.users.update',
+    {
+      usergroup => $self->oncall_group_address,
+      users => join(q{,}, @userids),
+    },
+    privileged => 1,
+  );
 
-        # Don't set our local cache until we're sure we've actually updated
-        # the slack group; this way, if something goes wrong setting the group
-        # the first time, we'll actually try again the next time around,
-        # rather than just saying "oh, nothing changed, great!"
-        $self->_set_oncall_list(\@new);
-        $self->_announce_oncall_change(\@have, \@new);
-      });
+  my $data = decode_json($http_res->decoded_content);
 
-      return $f;
-    })->retain;
+  unless ($data->{ok}) {
+    $Logger->log(["error updating oncall slack group: %s", $data]);
+    return;
+  }
+
+  # Don't set our local cache until we're sure we've actually updated
+  # the slack group; this way, if something goes wrong setting the group
+  # the first time, we'll actually try again the next time around,
+  # rather than just saying "oh, nothing changed, great!"
+  $self->_set_oncall_list(\@new);
+
+  return await $self->_announce_oncall_change(\@have, \@new);
 }
 
-sub _announce_oncall_change ($self, $before, $after) {
+async sub _announce_oncall_change ($self, $before, $after) {
   return unless $self->oncall_change_announce_address;
 
   my %before = map {; ($self->username_from_pd($_) // $_) => 1 } $before->@*;
@@ -1105,24 +1115,25 @@ sub _announce_oncall_change ($self, $before, $after) {
 
   my @blocks = bk_richsection(bk_richtext($text));
 
-  $self->_active_incidents_summary->then(sub ($summary = {}) {
-    if (my $summary_text = delete $summary->{text}) {
-      $text .= "\n$summary_text";
-    }
+  my $summary = await $self->_active_incidents_summary;
+  $summary //= {};
 
-    if (my $slack = delete $summary->{slack}) {
-      push @blocks, { type => 'divider' };
-      push @blocks, $slack->{blocks}->@*;
-    }
+  if (my $summary_text = delete $summary->{text}) {
+    $text .= "\n$summary_text";
+  }
 
-    $self->oncall_channel->send_message(
-      $self->oncall_change_announce_address,
-      $text,
-      {
-        slack => bk_blocks(@blocks),
-      }
-    );
-  })->retain;
+  if (my $slack = delete $summary->{slack}) {
+    push @blocks, { type => 'divider' };
+    push @blocks, $slack->{blocks}->@*;
+  }
+
+  return await $self->oncall_channel->send_message(
+    $self->oncall_change_announce_address,
+    $text,
+    {
+      slack => bk_blocks(@blocks),
+    }
+  );
 }
 
 async sub _active_incidents_summary ($self) {
@@ -1178,22 +1189,22 @@ async sub _active_incidents_summary ($self) {
   return { text => $text, slack => $slack };
 }
 
-sub _get_pd_account ($self, $token) {
-  return $self->hub->http_get(
+async sub _get_pd_account ($self, $token) {
+  my $res = await $self->hub->http_get(
     $self->_url_for('/users/me'),
     Authorization => "Token token=$token",
     Accept        => 'application/vnd.pagerduty+json;version=2',
-  )->then(sub ($res) {
-    my $rc = $res->code;
+  );
 
-    return Future->fail('That token seems invalid.')
-      if $rc == 401;
+  my $rc = $res->code;
 
-    return Future->fail("Encountered error talking to LP: got HTTP $rc")
-      unless $res->is_success;
+  return await Future->fail('That token seems invalid.')
+    if $rc == 401;
 
-    return Future->done(decode_json($res->decoded_content));
-  })->retain;
+  return await Future->fail("Encountered error talking to LP: got HTTP $rc")
+    unless $res->is_success;
+
+  return decode_json($res->decoded_content);
 }
 
 __PACKAGE__->add_preference(
@@ -1216,29 +1227,20 @@ __PACKAGE__->add_preference(
   validator => async sub ($self, $token, $event) {
     $token =~ s/^\s*|\s*$//g;
 
-    my ($actual_val, $ret_err);
+    my $account = eval { await $self->_get_pd_account($token) };
 
-    $self->_get_pd_account($token)
-      ->then(sub ($account) {
-        $actual_val = $token;
+    return (undef, $@) unless $account;
 
-        my $id = $account->{user}{id};
-        my $email = $account->{user}{email};
-        $event->reply(
-          "Great! I found the PagerDuty user for $email, and will also set your PagerDuty user id to $id."
-        );
+    my $id    = $account->{user}{id};
+    my $email = $account->{user}{email};
 
-        $self->set_user_preference($event->from_user, 'user-id', $id)->then(sub {
-          Future->done
-        });
-      })
-      ->else(sub ($err, @) {
-        $ret_err = $err;
-        return Future->fail('bad auth');
-      })
-      ->block_until_ready;
+    await $event->reply(
+      "Great! I found the PagerDuty user for $email, and will also set your PagerDuty user id to $id."
+    );
 
-    return ($actual_val, $ret_err);
+    await $self->set_user_preference($event->from_user, 'user-id', $id);
+
+    return $token;
   },
 );
 
