@@ -350,23 +350,19 @@ sub send_expando_message ($self, $event, $text, $alts = {}) {
 # right now, because that state should properly go in the reactors. But since
 # this returns a future, reactors can implement that in the future if needed.
 # -- michael, 2019-02-05
-sub send_ephemeral_message ($self, $channel, $user, $text) {
+async sub send_ephemeral_message ($self, $channel, $user, $text) {
   $text =~ s/&/&amp;/g;
   $text =~ s/</&lt;/g;
   $text =~ s/>/&gt;/g;
 
-  my $ret_future = $self->loop->new_future;
-  $self->slack->api_call('chat.postEphemeral', {
+  my $http_res = await $self->slack->api_call('chat.postEphemeral', {
     text => $text,
     channel => $channel,
     user => $user,
     as_user => \1,
-  })->on_done(sub ($http_res) {
-    my $json = $JSON->decode($http_res->decoded_content);
-    $ret_future->done($json);
   });
 
-  return $ret_future;
+  return $JSON->decode($http_res->decoded_content);
 }
 
 sub note_reply ($self, $event, $future, $args = {}) {
