@@ -175,7 +175,7 @@ async sub _output_ticket ($self, $event, $id) {
   unless ($ok) {
     my $error = $@;
     $Logger->log([ "error fetching ticket %s from Zendesk", $id ]);
-    return Future->fail("PTN $id", 'http');
+    return await Future->fail("PTN $id", 'http');
   };
 
   my $status = $ticket->status;

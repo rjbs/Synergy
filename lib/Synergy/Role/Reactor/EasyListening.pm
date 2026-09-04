@@ -33,7 +33,7 @@ around start => async sub ($orig, $self, @args) {
     $Logger->log("notice: missing help in $pkg for listener $l->{name}");
   }
 
-  return Future->done;
+  return;
 };
 
 sub help_entries ($self) {
