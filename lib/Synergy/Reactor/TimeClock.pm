@@ -407,39 +407,10 @@ sub check_for_shift_changes ($self) {
       next unless $will_send;
 
       $Logger->log([ "kicking off %s report for %s", $which, $user->username ]);
-      my $report = $report_reactor->begin_report($report{$which}, $user);
 
-      $report
-        ->else(sub (@error) {
-          $Logger->log([
-            "ERROR sending %s report to %s: %s",
-            $which,
-            $user->username,
-            "@error",
-          ]);
-          Future->done;
-        })
-        ->then(sub ($text, $alts) {
-          unless (defined $text) {
-            # I don't know anymore whether this is odd.  Rather than audit, I'm
-            # going to add this log line and then either drop it when I realize
-            # it happens all the time on purpose *or* fix things where it shows
-            # up. -- rjbs, 2024-04-19
-            $Logger->log([
-              "no text returned by %s report for %s",
-              $which,
-              $user->username,
-            ]);
-            return Future->done;
-          }
-
-          $Logger->log([ "sending %s report for %s", $which, $user->username ]);
-          $channel->send_message_to_user($user, $text, $alts);
-
-          $self->set_last_report_time_for($user->username, $now);
-          return Future->done;
-        })
-        ->retain;
+      # Not awaited: every user's report should be in flight at once.
+      $self->_send_shift_report($channel, $report{$which}, $which, $user, $now)
+           ->retain;
 
       next USER;
     }
@@ -447,6 +418,46 @@ sub check_for_shift_changes ($self) {
 
   $self->last_report_time($now);
   $self->save_state;
+}
+
+async sub _send_shift_report ($self, $channel, $report_spec, $which, $user, $now) {
+  my $report_reactor = $self->hub->reactor_named('report');
+
+  my ($text, $alts) = eval {
+    await $report_reactor->begin_report($report_spec, $user);
+  };
+
+  if (my $error = $@) {
+    $Logger->log([
+      "ERROR sending %s report to %s: %s",
+      $which,
+      $user->username,
+      $error,
+    ]);
+
+    return;
+  }
+
+  unless (defined $text) {
+    # I don't know anymore whether this is odd.  Rather than audit, I'm
+    # going to add this log line and then either drop it when I realize
+    # it happens all the time on purpose *or* fix things where it shows
+    # up. -- rjbs, 2024-04-19
+    $Logger->log([
+      "no text returned by %s report for %s",
+      $which,
+      $user->username,
+    ]);
+
+    return;
+  }
+
+  $Logger->log([ "sending %s report for %s", $which, $user->username ]);
+  await $channel->send_message_to_user($user, $text, $alts);
+
+  $self->set_last_report_time_for($user->username, $now);
+
+  return;
 }
 
 __PACKAGE__->add_preference(

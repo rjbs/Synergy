@@ -307,10 +307,10 @@ sub send_message ($self, $channel, $text, $alts = {}) {
   return $self->_send_plain_text($channel, $text);
 }
 
-sub send_reaction ($self, $reaction, $arg) {
+async sub send_reaction ($self, $reaction, $arg) {
   my $remove = $reaction =~ s/^-//;
 
-  my $http_future = $self->api_call(
+  my $http_res = await $self->api_call(
     ($remove ? 'reactions.remove' : 'reactions.add'),
     {
       name      => $reaction,
@@ -319,17 +319,12 @@ sub send_reaction ($self, $reaction, $arg) {
     }
   );
 
-  my $f = $self->loop->new_future;
+  my $res = decode_json($http_res->decoded_content);
 
-  $http_future->on_done(sub ($http_res) {
-    my $res = decode_json($http_res->decoded_content);
-    return $f->done({
-      type => 'slack',
-      transport_data => $res
-    });
-  });
-
-  return $f;
+  return {
+    type => 'slack',
+    transport_data => $res,
+  };
 }
 
 sub _send_plain_text ($self, $channel, $text) {
@@ -348,7 +343,7 @@ sub _send_plain_text ($self, $channel, $text) {
   return $f;
 }
 
-sub _send_rich_text ($self, $channel, $rich, $alts) {
+async sub _send_rich_text ($self, $channel, $rich, $alts) {
   my %args = (
     ($alts->{slack_postmessage_args} ? $alts->{slack_postmessage_args}->%* : ()),
     channel => $channel,
@@ -365,36 +360,33 @@ sub _send_rich_text ($self, $channel, $rich, $alts) {
     $Logger->log_fatal([ 'got unexpected slack alt: %s', $rich ]);
   }
 
-  my $http_future = $self->api_call('chat.postMessage', \%args);
+  my $http_res = eval { await $self->api_call('chat.postMessage', \%args) };
 
-  $http_future->on_fail(sub (@rest) {
-    $Logger->log([ "error with chat.postMessage: %s", \@rest ]);
-  });
+  unless ($http_res) {
+    my $error = $@;
+    $Logger->log([ "error with chat.postMessage: %s", $error ]);
+    return await Future->fail($error);
+  }
 
-  my $f = $self->loop->new_future;
-  $http_future->on_done(sub ($http_res) {
-    my $payload = eval {
-      decode_json($http_res->decoded_content(charset => undef));
-    };
+  my $payload = eval {
+    decode_json($http_res->decoded_content(charset => undef));
+  };
 
-    unless ($payload) {
-      my $error = $@;
+  unless ($payload) {
+    my $error = $@;
 
-      $Logger->log([
-        "chat.postMessage did not return JSON in %s reply",
-        $http_res->code,
-      ]);
+    $Logger->log([
+      "chat.postMessage did not return JSON in %s reply",
+      $http_res->code,
+    ]);
 
-      die $error;
-    }
+    die $error;
+  }
 
-    $f->done({
-      type => 'slack',
-      transport_data => $payload,
-    });
-  });
-
-  return $f;
+  return {
+    type => 'slack',
+    transport_data => $payload,
+  };
 }
 
 async sub send_file ($self, $channel, $filename, $content, $title = undef) {
