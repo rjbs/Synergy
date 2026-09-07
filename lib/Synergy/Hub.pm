@@ -21,6 +21,7 @@ use Synergy::UserDirectory;
 use Path::Tiny ();
 use Plack::App::URLMap;
 use Prometheus::Tiny 0.002;
+use Sub::Install ();
 use Synergy::Environment;
 use Synergy::HTTPServer;
 use Synergy::Util qw(read_config_file);

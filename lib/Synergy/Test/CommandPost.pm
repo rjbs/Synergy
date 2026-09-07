@@ -5,6 +5,11 @@ use Synergy::Event ();
 use Synergy::CommandPost ();
 use Synergy::Role::Reactor::CommandPost ();
 
+# Used below by full name only. Loaded here because this is an installed
+# module now, so we can't rely on our caller having pulled them in.
+use Sub::Install ();
+use Test::Deep ();
+
 use Sub::Exporter -setup => {
   exports => [ qw(
     create_outpost
