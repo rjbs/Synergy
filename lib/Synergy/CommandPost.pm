@@ -1,6 +1,7 @@
 use v5.36.0;
 package Synergy::CommandPost;
 
+use Sub::Install ();
 use Synergy::PotentialReaction;
 
 =head1 OVERVIEW
