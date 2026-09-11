@@ -135,13 +135,13 @@ sub duties_on ($self, $dt) {
     my $items = $self->_get_duty_items_between($ymd, $ymd);
     return unless $items; # Error.
 
-    $cached->{$ymd} = {
+    $cached = $self->_duty_cache->{$ymd} = {
       at    => time,
       items => $items,
     };
   }
 
-  return $cached->{$ymd}{items};
+  return $cached->{items};
 }
 
 sub _get_duty_items_between ($self, $from_ymd, $to_ymd) {
