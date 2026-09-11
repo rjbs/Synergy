@@ -136,12 +136,28 @@ sub duties_on ($self, $dt) {
     return unless $items; # Error.
 
     $cached = $self->_duty_cache->{$ymd} = {
-      at    => time,
-      items => $items,
+      at     => time,
+      duties => [ map {; $self->duty_for_event($_) } @$items ],
     };
   }
 
-  return $cached->{items};
+  return $cached->{duties};
+}
+
+# Every event on a duty calendar is a duty, even the ones we didn't put there.
+# If we can't work out what rotor an event belongs to -- because a human made
+# it by hand, or because its rotor has been renamed or dropped from the config
+# -- we still want to report it, so it gets a duty with no rotor rather than
+# being thrown away. -- claude, 2026-09-11
+sub duty_for_event ($self, $event) {
+  my $duty = Synergy::Rototron::Duty->new({ event => $event });
+
+  if (my $keyword = $duty->rotor_keyword) {
+    my ($rotor) = grep {; $_->keyword eq $keyword } $self->rotors;
+    $duty->_set_rotor($rotor) if $rotor;
+  }
+
+  return $duty;
 }
 
 sub _get_duty_items_between ($self, $from_ymd, $to_ymd) {
@@ -332,6 +348,71 @@ sub compute_rotor_update ($self, $from_dt, $to_dt) {
     create  => \%create,
     destroy => [ keys %should_destroy ],
   }
+}
+
+package Synergy::Rototron::Duty {
+
+  use Moose;
+  use experimental qw(signatures);
+
+  use Synergy::Logger '$Logger';
+
+  # A single event on a duty calendar, along with the rotor that put it there,
+  # if we could figure out which rotor that was.  The event is the raw JMAP
+  # CalendarEvent hash; everything interesting about it is carried in its
+  # keywords. -- claude, 2026-09-11
+
+  has event => (is => 'ro', required => 1);
+
+  has rotor => (
+    is      => 'ro',
+    writer  => '_set_rotor',
+  );
+
+  sub title ($self) { $self->event->{title} }
+
+  # Events made by hand may have no keywords at all.
+  sub keywords ($self) { $self->event->{keywords} // {} }
+
+  # Returns the only keyword with the given prefix, or undef if there isn't
+  # exactly one.  When an event carries two rotor keywords we have no way to
+  # choose between them, so we decline to guess, just as the planner does.
+  # -- claude, 2026-09-11
+  my sub sole_keyword ($duty, $prefix) {
+    my (@found) = grep {; index($_, $prefix) == 0 } keys $duty->keywords->%*;
+
+    return @found == 1 ? $found[0] : undef;
+  }
+
+  has rotor_keyword => (
+    is        => 'ro',
+    lazy      => 1,
+    init_arg  => undef,
+    default   => sub ($self, @) { sole_keyword($self, 'rotor:') },
+  );
+
+  has username => (
+    is        => 'ro',
+    lazy      => 1,
+    init_arg  => undef,
+    default   => sub ($self, @) {
+      my $keyword  = sole_keyword($self, 'username:');
+      my $username = defined $keyword ? $keyword =~ s/^username://r : undef;
+
+      # An event we didn't plan has no business having a username keyword, so
+      # only complain about the ones we did. -- claude, 2026-09-11
+      if (! defined $username && $self->rotor_keyword) {
+        $Logger->log([
+          "didn't find exactly one username keyword on duty event: %s",
+          $self->event,
+        ]);
+      }
+
+      return $username;
+    },
+  );
+
+  no Moose;
 }
 
 package Synergy::Rototron::Rotor {
