@@ -234,29 +234,21 @@ sub current_officers_for_duty ($self, $duty_name) {
 
   my $now  = DateTime->now(time_zone => 'UTC');
 
-  my $items = $self->rototron->_get_duty_items_between($now, $now);
+  my $items = $self->rototron->_get_duty_items_between($now, $now) // [];
 
   my @users = grep {; defined && $_->is_working_now }
-              map  {; $self->_user_from_duty($_) }
-              grep {; $_->{keywords}{"rotor:$duty_name"} }
+              map  {; $self->_user_for_duty($_) }
+              grep {; $_->rotor && $_->rotor->name eq $duty_name }
+              map  {; $self->rototron->duty_for_event($_) }
               @$items;
 
   return uniq sort @users;
 }
 
-sub _user_from_duty ($self, $duty) {
-  my (@user_keywords) = grep {; /^username:/ } keys $duty->{keywords}->%*;
+sub _user_for_duty ($self, $duty) {
+  my $username = $duty->username;
 
-  if (@user_keywords != 1) {
-    $Logger->log([
-      "didn't find exactly one username keyword on duty event: %s",
-      $duty,
-    ]);
-
-    return;
-  }
-
-  my $username = $user_keywords[0] =~ s/^username://r;
+  return undef unless defined $username;
 
   return $self->hub->user_directory->user_named($username);
 }
@@ -317,23 +309,14 @@ command duty => {
   }
 
   my @lines;
-  for my $rotor ($self->rototron->rotors) {
-    my $dt = $when_dt;
-    if ($rotor->time_zone && $is_now) {
-      $dt = $dt->clone;
-      $dt->set_time_zone($rotor->time_zone);
-    }
+  for my $duty (@{ $self->rototron->duties_on($when_dt) || [] }) {
+    my $user = $self->_user_for_duty($duty);
 
-    for my $duty (@{ $self->rototron->duties_on($dt) || [] }) {
-      next unless $duty->{keywords}{ $rotor->keyword };
-
-      my $user = $self->_user_from_duty($duty);
-      push @lines, $duty->{title}
-                 . ', ' . $dt->ymd
-                 . (($is_now && $user && $user->is_working_now)
-                    ? q{ *(on the clock)*}
-                    : q{});
-    }
+    push @lines, $duty->title
+               . ', ' . $when_dt->ymd
+               . (($is_now && $user && $user->is_working_now)
+                  ? q{ *(on the clock)*}
+                  : q{});
   }
 
   unless (@lines) {
