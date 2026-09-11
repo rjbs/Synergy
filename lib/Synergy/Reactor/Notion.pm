@@ -41,11 +41,11 @@ has username_domain => (
   required => 1,
 );
 
-sub _project_pages ($self) {
+async sub _project_pages ($self) {
   my $db_id = $self->project_db_id;
   my $token = $self->api_token;
 
-  $self->hub->http_post(
+  my $res = await $self->hub->http_post(
     "https://api.notion.com/v1/databases/$db_id/query",
 
     'User-Agent'      => 'Synergy/2021.05',
@@ -66,12 +66,11 @@ sub _project_pages ($self) {
         ]
       }
     }),
-  )->then(sub ($res) {
-    my $data  = $JSON->decode($res->decoded_content(charset => undef));
-    my @pages = $data->{results}->@*;
+  );
 
-    return Future->done(@pages);
-  });
+  my $data = $JSON->decode($res->decoded_content(charset => undef));
+
+  return $data->{results}->@*;
 }
 
 responder my_projects => {

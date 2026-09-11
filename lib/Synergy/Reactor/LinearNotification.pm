@@ -8,6 +8,7 @@ with 'Synergy::Role::Reactor', 'Synergy::Role::HTTPEndpoint';
 use namespace::clean;
 use Synergy::Logger '$Logger';
 
+use Future::AsyncAwait;
 use JSON::MaybeXS qw(encode_json decode_json);
 use Try::Tiny;
 use Synergy::Reactor::Linear;
@@ -139,48 +140,63 @@ sub http_app ($self, $env) {
       }
 
       if ($was_create || $was_update) {
-        $self->linear->users->then(sub ($users) {
-          my %by_id = map { $users->{$_}->{id} => $users->{$_} } keys %$users;
-
-          return Future->done($by_id{$payload->{data}->{creatorId}}->{displayName} // 'unknown');
-        })->then(sub ($who) {
-          my $desc = $was_create ? 'New task created for' : 'Existing task moved to';
-          my $app = $was_create ? 'Zendesk' : 'Linear';
-          $who = 'someone' unless $was_create;
-
-          my $base_text = sprintf
-            "%s %s escalation by %s in %s: %s",
-            $ESCALATION_EMOJI,
-            $desc,
-            $who,
-            $app,
-            $payload->{data}{title};
-
-          my ($identifier) = $payload->{url} =~ m{/linear\.app/fastmail/issue/([A-Z]+-[0-9]+)/};
-          $identifier //= $payload->{url};
-          my $text  = "$base_text ($payload->{url})";
-          my $slack = "$base_text (<$payload->{url}|$identifier>)";
-
-          if (my $rototron = $self->_rototron) {
-            my $roto_reactor = $self->hub->reactor_named('rototron');
-
-            for my $officer ($roto_reactor->current_triage_officers) {
-              $Logger->log(["notifying %s of new escalation task", $officer->username ]);
-              $channel->send_message_to_user($officer, $text, { slack => $slack });
-            }
-          }
-
-          return $channel->send_message($self->escalation_address, $text, { slack => $slack });
-        })->catch(sub {
-          $Logger->log("failed to tell escalation about a ticket create in linear: @_");
-
-          return $channel->send_message($self->escalation_address, "Uh, failed to tell you about a ticket create (@_)");
-        })->retain;
+        $self->_announce_escalation($channel, $payload, $was_create)->retain;
       }
     }
   }
 
   return [ "200", [], [ '{"o":"k"}' ] ];
+}
+
+async sub _announce_escalation ($self, $channel, $payload, $was_create) {
+  my $ok = eval {
+    my $users = await $self->linear->users;
+
+    my %by_id = map { $users->{$_}->{id} => $users->{$_} } keys %$users;
+
+    my $who = $was_create
+            ? ($by_id{ $payload->{data}{creatorId} }{displayName} // 'unknown')
+            : 'someone';
+
+    my $desc = $was_create ? 'New task created for' : 'Existing task moved to';
+    my $app  = $was_create ? 'Zendesk' : 'Linear';
+
+    my $base_text = sprintf
+      "%s %s escalation by %s in %s: %s",
+      $ESCALATION_EMOJI,
+      $desc,
+      $who,
+      $app,
+      $payload->{data}{title};
+
+    my ($identifier) = $payload->{url} =~ m{/linear\.app/fastmail/issue/([A-Z]+-[0-9]+)/};
+    $identifier //= $payload->{url};
+    my $text  = "$base_text ($payload->{url})";
+    my $slack = "$base_text (<$payload->{url}|$identifier>)";
+
+    if (my $rototron = $self->_rototron) {
+      my $roto_reactor = $self->hub->reactor_named('rototron');
+
+      for my $officer ($roto_reactor->current_triage_officers) {
+        $Logger->log(["notifying %s of new escalation task", $officer->username ]);
+        await $channel->send_message_to_user($officer, $text, { slack => $slack });
+      }
+    }
+
+    await $channel->send_message($self->escalation_address, $text, { slack => $slack });
+
+    1;
+  };
+
+  return if $ok;
+
+  my $error = $@;
+  $Logger->log("failed to tell escalation about a ticket create in linear: $error");
+
+  return await $channel->send_message(
+    $self->escalation_address,
+    "Uh, failed to tell you about a ticket create ($error)",
+  );
 }
 
 1;

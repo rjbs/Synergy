@@ -61,26 +61,24 @@ package Synergy::Reactor::Linear::LinearHelper {
   }
 
   # Okay, sorry, this subroutine is Extremely Fastmail™. -- rjbs, 2022-10-06
-  sub project_ids_for_tag ($self, $tag) {
+  async sub project_ids_for_tag ($self, $tag) {
     my $notion = $self->{reactor}->hub->reactor_named('notion');
 
-    unless ($notion) {
-      return Future->done;
-    }
+    return unless $notion;
 
-    return $notion->_project_pages->then(sub (@pages) {
-      @pages = grep {;
-        ($_->{properties}{Hashtag}{rich_text}[0]{plain_text} // '') eq $tag
-      } @pages;
+    my @pages = await $notion->_project_pages;
 
-      my @slug_ids =
-        map  {; m{-([a-z0-9]+)(?:/[A-Z]+)?\z} ? $1 : () }
-        grep {; length }
-        map  {; $_->{properties}{'Linear Project'}{url} }
-        @pages;
+    @pages = grep {;
+      ($_->{properties}{Hashtag}{rich_text}[0]{plain_text} // '') eq $tag
+    } @pages;
 
-      Future->done(@slug_ids);
-    });
+    my @slug_ids =
+      map  {; m{-([a-z0-9]+)(?:/[A-Z]+)?\z} ? $1 : () }
+      grep {; length }
+      map  {; $_->{properties}{'Linear Project'}{url} }
+      @pages;
+
+    return @slug_ids;
   }
 }
 

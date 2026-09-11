@@ -248,8 +248,8 @@ sub handle_dispatch {
 
     $Logger->log("Discord: ready for service, I am $data->{user}{username} ($data->{user}{id})");
 
-    $self->load_users;
-    $self->load_channels;
+    $self->load_users->retain;
+    $self->load_channels->retain;
 
     $self->connected(1);
     return;
@@ -515,56 +515,61 @@ has readiness => (
   }
 );
 
-sub load_users ($self) {
+async sub load_users ($self) {
   my $guild_id = $self->guild_id;
-  $self->api_get("/guilds/$guild_id/members", {
+
+  my $http_res = await $self->api_get("/guilds/$guild_id/members", {
     limit => 1000,
-  })->on_done(sub ($http_res) {
-    my $json = $http_res->decoded_content(charset => undef);
-    my $res  = decode_json($json);
+  });
 
-    $Logger->log("Discord: users loaded");
-    $Logger->log_debug([ 'Discord: user list: %s', $res ]);
+  my $json = $http_res->decoded_content(charset => undef);
+  my $res  = decode_json($json);
 
-    $self->_set_users({
-      map { $_->{user}{id} => $_ } @$res,
-    });
+  $Logger->log("Discord: users loaded");
+  $Logger->log_debug([ 'Discord: user list: %s', $res ]);
 
-    $self->loaded_users(1);
-    if ($self->loaded_channels) {
-      # This is sort of weird and probably indicates the need to reconsider how
-      # reconnections work.  If we lose the connection to Discord, we end up
-      # reconnecting, which ends up reloading users, which then calls
-      # ->readiness->done.  Since we will have already set readiness to done on
-      # the previous connection, this was fatal.
-      $self->readiness->done unless $self->readiness->is_ready;
-    }
-  })->retain;
+  $self->_set_users({
+    map { $_->{user}{id} => $_ } @$res,
+  });
+
+  $self->loaded_users(1);
+  $self->_become_ready_if_loaded;
+
+  return;
 }
 
-sub load_channels ($self) {
+async sub load_channels ($self) {
   my $guild_id = $self->guild_id;
-  $self->api_get("/guilds/$guild_id/channels")->on_done(sub ($http_res) {
-    my $json = $http_res->decoded_content(charset => undef);
-    my $res  = decode_json($json);
 
-    my ($channels, $dms, $voice_channels, $group_dms) = part { $_->{type} } @$res;
-    $self->set_channel($_) for @$channels;
-    $self->set_dm_channel($_) for @$dms;
-    $self->set_group_conversation($_) for @$group_dms;
+  my $http_res = await $self->api_get("/guilds/$guild_id/channels");
 
-    $Logger->log("Discord: channels loaded");
+  my $json = $http_res->decoded_content(charset => undef);
+  my $res  = decode_json($json);
 
-    $self->loaded_channels(1);
-    if ($self->loaded_users) {
-      # This is sort of weird and probably indicates the need to reconsider how
-      # reconnections work.  If we lose the connection to Discord, we end up
-      # reconnecting, which ends up reloading users, which then calls
-      # ->readiness->done.  Since we will have already set readiness to done on
-      # the previous connection, this was fatal.
-      $self->readiness->done unless $self->readiness->is_ready;
-    }
-  })->retain;
+  my ($channels, $dms, $voice_channels, $group_dms) = part { $_->{type} } @$res;
+  $self->set_channel($_) for @$channels;
+  $self->set_dm_channel($_) for @$dms;
+  $self->set_group_conversation($_) for @$group_dms;
+
+  $Logger->log("Discord: channels loaded");
+
+  $self->loaded_channels(1);
+  $self->_become_ready_if_loaded;
+
+  return;
+}
+
+sub _become_ready_if_loaded ($self) {
+  return unless $self->loaded_users && $self->loaded_channels;
+
+  # This is sort of weird and probably indicates the need to reconsider how
+  # reconnections work.  If we lose the connection to Discord, we end up
+  # reconnecting, which ends up reloading users, which then calls
+  # ->readiness->done.  Since we will have already set readiness to done on
+  # the previous connection, this was fatal.
+  $self->readiness->done unless $self->readiness->is_ready;
+
+  return;
 }
 
 1;
